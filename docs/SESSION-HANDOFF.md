@@ -47,7 +47,7 @@ grep -oE "resp=\{.{0,160}" logs/endpoints.log  # structured payloads — spot si
 mvn -B test                                    # MockMvc suite, runs offline (no model needed)
 ```
 
-## Logging layer (uncommitted)
+## Logging layer
 
 - `config/EndpointLoggingFilter.java` — `OncePerRequestFilter` at `HIGHEST_PRECEDENCE`; MDC `requestId`
   (honours inbound `X-Request-Id`, echoes it on the response); bodies capped at 2000 chars, binary and
@@ -175,7 +175,7 @@ so keys don't reach the logs.
 ## Open work
 
 1. The change set (logging layer, advice, five controllers, yml, README, this doc) is committed on `main`
-   as one commit — nothing is left uncommitted in the working tree.
+   as `7c54709` and pushed to `origin` — nothing is left uncommitted in the working tree.
 2. `ARCHITECTURE_AND_METHODS.md` still describes the old RAG thresholds and the `/vision/describe` route.
 3. `/tools/multi` has no forced tool choice (deliberate: it demonstrates model-dispatched selection);
    it inherits temperature 0.7 and refuses more often than the single-tool endpoints.
