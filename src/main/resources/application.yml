@@ -18,12 +18,25 @@ spring:
           temperature: 0.7
       embedding:
         options:
-          model: ${OPENAI_EMBEDDING_MODEL:qwen2.5}
+          # Needs a real embedding model (all-minilm, nomic-embed-text, text-embedding-3-small). A chat
+          # model used as the vectorizer produces near-random cosine scores, so short queries match nothing.
+          model: ${OPENAI_EMBEDDING_MODEL:all-minilm}
+
+logging:
+  directory: logs
+  level:
+    ENDPOINT_ACCESS: INFO
+    # Spring AI's retry interceptor prints a full stack for every failed attempt; GlobalExceptionHandler
+    # already reports the root cause once per request, with the requestId to correlate it.
+    org.springframework.ai.autoconfigure.retry: ERROR
 
 app:
   rag:
-    similarity-threshold: 0.65
-    top-k: 3
+    # Read by RagController: threshold applies to the grounded /query path only.
+    # all-minilm cosine for a relevant short question against these chunks lands around 0.3-0.45, so a
+    # cutoff above ~0.4 silently drops the context and the model answers from memory.
+    similarity-threshold: 0.2
+    top-k: 4
 
 management:
   endpoints:

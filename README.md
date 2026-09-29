@@ -110,7 +110,38 @@ export OPENAI_API_KEY="ollama"
 export OPENAI_BASE_URL="http://192.168.1.100:11434"
 export OPENAI_MODEL="llama3.1"
 mvn spring-boot:run
+
+# Option C: Ollama on this machine (RAG needs an embedding model as well as a chat model)
+ollama pull qwen2.5:0.5b-instruct
+ollama pull all-minilm
+export OPENAI_API_KEY="ollama"
+export OPENAI_BASE_URL="http://localhost:11434"   # no /v1 suffix; the client appends it
+export OPENAI_MODEL="qwen2.5:0.5b-instruct"
+export OPENAI_EMBEDDING_MODEL="all-minilm"
+mvn spring-boot:run
 ```
+
+> Point `OPENAI_BASE_URL` at a backend that serves both `/v1/chat/completions` and `/v1/embeddings`. Using a chat model as the embedder makes cosine scores meaningless, and short queries then match nothing.
+
+---
+
+## 📋 Logs
+
+Every request is written to two files (created on first run, git-ignored):
+
+| File | Contents |
+| :--- | :--- |
+| `logs/endpoints.log` | One line per call: method, path + query, status, latency, client IP, truncated request/response bodies, `requestId`. |
+| `logs/app.log` | Full application log, including the stack trace behind a failure, correlated by the same `requestId`. Streaming calls are recorded without their bodies so SSE is not buffered. |
+
+```bash
+tail -f logs/endpoints.log                     # one line per call
+grep <requestId> logs/app.log                  # the whole story for one request
+grep SPRING-AI-TOOL logs/app.log               # proof a tool really executed
+grep -oE "resp=\{.{0,160}" logs/endpoints.log  # structured payloads
+```
+
+Headers are never logged, so API keys stay out of both files.
 
 ---
 
@@ -292,12 +323,25 @@ curl "http://localhost:8080/api/ai/tools/multi?prompt=Check+the+weather+in+Londo
 ---
 
 ### 8. Multimodal Vision Analysis
-- **Endpoint**: `GET /api/ai/vision/describe`
-- **Parameters**: `imageUrl` (String), `question` (String)
+- **Endpoint**: `GET /api/ai/vision/analyze`
+- **Parameters**: `imageUrl` (String, **required**), `question` (String, optional)
 
 ```bash
-curl "http://localhost:8080/api/ai/vision/describe?imageUrl=https://upload.wikimedia.org/wikipedia/commons/thumb/4/47/PNG_transparency_demonstration_1.png/280px-PNG_transparency_demonstration_1.png&question=What+shapes+and+colors+are+in+this+picture?"
+# Any publicly reachable raster image. The server downloads it, so the URL must work without a browser.
+curl -G "http://localhost:8080/api/ai/vision/analyze" \
+  --data-urlencode "imageUrl=<public-image-url>" \
+  --data-urlencode "question=What shapes and colors are in this picture?"
 ```
+
+Pick the URL yourself — the endpoint takes no default asset. Requirements, learned the hard way:
+
+- Direct file URL, not a resized thumbnail path (some CDNs, Wikimedia included, return **400** for sizes
+  they don't publish and **403** to requests without a `User-Agent` — the server sends one).
+- Public internet addresses only. The server refuses loopback, private, link-local and cloud-metadata
+  ranges with `400 image_unavailable`, because it fetches the caller's URL.
+
+> **Requires a vision model.** The configured chat model must have an image encoder (`llava`, `qwen2.5-vl`, `gpt-4o`, `gemini-...`). A text-only model such as `qwen2.5:0.5b-instruct` rejects the request and the API returns `502 llm_backend_rejected`.
+> The image is downloaded by the server with a `User-Agent` header — hotlinks without one are refused with `403` by Wikimedia and other CDNs. Public image URLs are fetched, so avoid internal or file-backed addresses.
 
 ---
 

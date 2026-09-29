@@ -37,7 +37,10 @@ public class RagDocumentIngestionService implements CommandLineRunner {
                 textReader.getCustomMetadata().put("filename", resource.getFilename());
                 List<Document> documents = textReader.get();
 
-                TokenTextSplitter splitter = new TokenTextSplitter(400, 100, 5, 1000, true);
+                // One chunk per section, not one per document: with a whole policy file in a single embedding,
+                // every question matches the same vector and a small model answers from whichever section it
+                // reads first.
+                TokenTextSplitter splitter = new TokenTextSplitter(120, 50, 5, 1000, true);
                 List<Document> splitDocuments = splitter.apply(documents);
 
                 vectorStore.accept(splitDocuments);

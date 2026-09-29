@@ -7,8 +7,10 @@ import org.springframework.ai.chat.client.advisor.QuestionAnswerAdvisor;
 import org.springframework.ai.document.Document;
 import org.springframework.ai.vectorstore.SearchRequest;
 import org.springframework.ai.vectorstore.VectorStore;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.web.bind.annotation.*;
 
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -18,11 +20,17 @@ public class RagController {
 
     private final ChatClient chatClient;
     private final VectorStore vectorStore;
+    private final int defaultTopK;
 
-    public RagController(ChatClient.Builder chatClientBuilder, VectorStore vectorStore) {
+    public RagController(ChatClient.Builder chatClientBuilder,
+                         VectorStore vectorStore,
+                         @Value("${app.rag.top-k:4}") int defaultTopK,
+                         @Value("${app.rag.similarity-threshold:0.5}") double similarityThreshold) {
         this.vectorStore = vectorStore;
+        this.defaultTopK = defaultTopK;
         this.chatClient = chatClientBuilder
-                .defaultAdvisors(new QuestionAnswerAdvisor(vectorStore, SearchRequest.query("").withTopK(4).withSimilarityThreshold(0.5)))
+                .defaultAdvisors(new QuestionAnswerAdvisor(vectorStore,
+                        SearchRequest.query("").withTopK(defaultTopK).withSimilarityThreshold(similarityThreshold)))
                 .build();
     }
 
@@ -33,7 +41,7 @@ public class RagController {
         // 1. Perform similarity search directly to extract source snippets for provenance
         List<Document> similarDocuments = vectorStore.similaritySearch(
                 SearchRequest.query(request.question())
-                        .withTopK(request.topK() > 0 ? request.topK() : 3)
+                        .withTopK(request.topK() > 0 ? request.topK() : defaultTopK)
         );
 
         List<String> sourceDocs = similarDocuments.stream()
@@ -54,14 +62,17 @@ public class RagController {
         return new RagQueryResponse(request.question(), answer != null ? answer : "", sourceDocs, duration);
     }
 
+    // An inspection endpoint: an empty list must not look like an empty store, so the reason for zero
+    // matches is reported. M4's SimpleVectorStore drops the similarity score from the returned documents.
     @GetMapping("/search")
     public Map<String, Object> rawVectorSearch(
             @RequestParam String query,
-            @RequestParam(defaultValue = "3") int topK) {
+            @RequestParam(required = false, defaultValue = "0") int topK) {
 
         List<Document> documents = vectorStore.similaritySearch(
                 SearchRequest.query(query)
-                        .withTopK(topK)
+                        .withTopK(topK > 0 ? topK : defaultTopK)
+                        .withSimilarityThresholdAll()
         );
 
         List<Map<String, Object>> results = documents.stream()
@@ -72,6 +83,14 @@ public class RagController {
                 ))
                 .toList();
 
-        return Map.of("query", query, "totalResults", results.size(), "results", results);
+        Map<String, Object> response = new LinkedHashMap<>();
+        response.put("query", query);
+        response.put("totalResults", results.size());
+        response.put("results", results);
+        if (results.isEmpty()) {
+            response.put("note", "No stored chunk scored above 0.0 cosine for this query;"
+                    + " the search floor cannot be lowered further because negative similarity is always discarded.");
+        }
+        return response;
     }
 }

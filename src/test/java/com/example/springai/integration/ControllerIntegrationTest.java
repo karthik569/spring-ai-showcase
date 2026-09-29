@@ -4,8 +4,13 @@ import com.example.springai.controller.ChatController;
 import com.example.springai.controller.StructuredOutputController;
 import com.example.springai.controller.ToolCallingController;
 import com.example.springai.dto.MovieRecommendation;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.chat.messages.AssistantMessage;
+import org.springframework.ai.chat.model.ChatResponse;
+import org.springframework.ai.chat.model.Generation;
 import org.springframework.http.MediaType;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
@@ -102,6 +107,19 @@ class ControllerIntegrationTest {
                     }
                     if ("entity".equals(method.getName())) {
                         return responsePayload;
+                    }
+                    if ("chatResponse".equals(method.getName())) {
+                        String text;
+                        if (responsePayload instanceof String asString) {
+                            text = asString;
+                        } else {
+                            try {
+                                text = new ObjectMapper().writeValueAsString(responsePayload);
+                            } catch (JsonProcessingException ex) {
+                                throw new IllegalStateException(ex);
+                            }
+                        }
+                        return new ChatResponse(List.of(new Generation(new AssistantMessage(text))));
                     }
                     return null;
                 }
