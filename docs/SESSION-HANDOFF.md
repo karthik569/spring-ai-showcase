@@ -1,13 +1,16 @@
 # Session handoff — spring-ai-showcase
 
 Working notes so the next person (or model) can resume cold. Updated 2026-09-30 on Windows.
-Not project documentation — see `README.md` and `ARCHITECTURE_AND_METHODS.md` for that.
+Not project documentation — see `docs/GETTING_STARTED.md` (on-ramp), `README.md` (reference) and
+`ARCHITECTURE_AND_METHODS.md` (the why) for that.
 
 **Start here:** Spring Boot **3.5.16** + Spring AI **1.1.8** (GA) on local Ollama (`qwen2.5:0.5b-instruct` chat
 + `all-minilm` embeddings). The upgrade, the new capabilities (RAG upload/filters/scores, persisted memory +
 history, token metrics, demo UI, Swagger, timeouts/health/concurrency) are **done and verified live**, and
-`README.md` / `ARCHITECTURE_AND_METHODS.md` now describe them. The change set is **committed on `main` as
-`e1b9ade`** and **not pushed** — `origin/main` is one behind. Pushing needs an explicit ask.
+`README.md` / `ARCHITECTURE_AND_METHODS.md` now describe them, and **`docs/GETTING_STARTED.md`** is the new
+beginner on-ramp (prerequisites, plain-language glossary, five verified steps in learning order) — that file and
+the README pointer are **not yet committed**. The upgrade itself is `e1b9ade` (+ `2b35ca4`, which recorded the
+SHA) and **both are pushed** to `origin/main`.
 
 ## Environment (this machine)
 
@@ -80,6 +83,17 @@ mvn -B spring-boot:run > run.log 2>&1 &
   `git -c user.name="karthik569" -c user.email="sahukarikarteek@gmail.com" commit …` — the identity every
   existing commit carries. Editing `git config` is off-limits, so the override is per command. No git hooks are
   active in this repo (only `.sample` files), so a failed commit is never a hook problem.
+- **Local embedding scores drift between runs.** The identical query/document pair read `0.1176` and then
+  `0.1228` on two calls to `/rag/search`. Ollama's embedder is not bit-stable, so never write a test or a doc
+  that asserts a third decimal.
+- **Try a config change without editing tracked YAML:**
+  `mvn -B spring-boot:run -Dspring-boot.run.arguments=--app.rag.similarity-threshold=0.4`. Verified: the `pto`
+  query goes from one citation (≈0.32) to zero at 0.4 — a clean demo of a threshold silently un-grounding an
+  answer, and the basis of `docs/GETTING_STARTED.md` §Step 3.
+- **Both the app and Ollama can die silently** between sessions (the CLI background task does not outlive the
+  session, and `ollama.exe` was gone too). Symptoms: `curl` → `HTTP 000` / exit 7 on 8080 or 11434. Restart
+  `ollama serve` first, then the app — an app that booted without a backend has an **empty vector store** and
+  must be restarted to re-ingest `classpath:/docs/*.md`.
 - **Windows `curl.exe` cannot read Git Bash `/tmp` paths** — it returns `HTTP 000` with no body. Write scratch
   files under `target/` and use a relative path for `-F file=@…`.
 - **Driving the browser without npm**: Node 22's global `WebSocket` + Edge `--remote-debugging-port=9222` speaks
@@ -87,7 +101,8 @@ mvn -B spring-boot:run > run.log 2>&1 &
 
 ## Verified behaviours (this session, live against Ollama)
 
-- Endpoint sweep, all 200 with correct shapes: `/api/ai/chat`, `/chat/template`, `/chat/stream` (SSE),
+- Endpoint sweep, all 200 with correct shapes *on that pass* (two of them alternate — see the re-verification
+  block below): `/api/ai/chat`, `/chat/template`, `/chat/stream` (SSE),
   `/chat/memory` (2-turn recall), `/chat/memory/history`, `DELETE /chat/memory`, `/structured/movie`,
   `/structured/code-review`, `/rag/query` (grounded: "$1,500 annual home office equipment stipend",
   score 0.607 on the cited chunk), `/rag/search` (scores + empty-result `note`), `POST /rag/documents`,
@@ -107,6 +122,24 @@ mvn -B spring-boot:run > run.log 2>&1 &
   `RecordMappingTest` and the RAG upload cases in `ControllerIntegrationTest` are new).
 - Both 413 paths verified live: a 600 KB file → `{"error":"request_rejected","status":413,"detail":"document is
   larger than 512 KB"}`, a 1.1 MB file → `document_too_large` from `MaxUploadSizeExceededException`.
+
+Re-verified while writing `docs/GETTING_STARTED.md` (same day, later run) — two behaviours worth knowing before
+you document any sample output:
+
+- **`/rag/query` prose is not reproducible; its citation list mostly is.** The stipend question answered
+  "Employees are entitled to a $1,500 annual home office equipment stipend." on one call and "You haven't
+  mentioned any specific instance of a home office equipment stipend…" on the next, **with the same chunk cited
+  at 0.60**. Same model, same prompt. So never assert an answer string in a doc or a test — assert
+  `sourceDocuments`.
+- **`/structured/movie` alternates between 200 and 422.** 200 carries invented-but-well-shaped facts
+  (`The Matrix`, 2016); 422 appears when the model leaves `director` empty, and its `rawModelOutput` then shows
+  `"title": "Inception", "releaseYear": 2017`. Both are correct behaviour of `validated(...)` — quote them as a
+  pair, not as one canonical response.
+- Live numbers from that pass: `pto` search top 0.3285 / second 0.1992, sentence query 0.5629, uploaded runbook
+  chunk 0.1118 (below the 0.2 threshold → `sourceDocuments: []`), `/chat/memory` recall answered `Miso.` and on
+  a second conversation `Misto.`, health details `{model, reply, latencyMs, probedAt}`, 8-request burst →
+  `503 503 503 503 200 200 200 200`.
+- `/v3/api-docs` reports **15** operations — don't quote a count in the docs; it changes with every endpoint.
 
 ## Deliberate non-decisions
 
@@ -142,14 +175,23 @@ moves them.
 
 ## Open work
 
-1. **`e1b9ade` is committed on `main` and not pushed** (`git status -sb` shows `ahead 1`). Push only when asked.
-   `data/` and the root `run*.log` / `ollama.log` / `pull.log` scratch files are gitignored, so they stayed out
-   of the commit — deleting them is safe but unnecessary.
-2. Optional: a small integration test for the upload → filter → answer path, so the filename filter is covered
+1. **`e1b9ade` and `2b35ca4` are pushed to `origin/main`.** Uncommitted since then: the new
+   `docs/GETTING_STARTED.md` plus the README pointer and the edits that produced this line. `data/` and the root
+   `run*.log` / `ollama.log` / `pull.log` scratch files are gitignored, so they stay out of commits — deleting
+   them is safe but unnecessary.
+2. **No `LICENSE` file and no `<licenses>` in `pom.xml`.** The repo is on GitHub; a newcomer cannot tell what
+   they may copy. Needs an author decision, not a code change.
+3. **No Maven wrapper** (`mvnw`, `mvnw.cmd`, `.mvn/` are absent, though `.gitignore` already has a
+   `maven-wrapper.jar` exception). `mvn` must be installed globally. `mvn wrapper:wrapper` would add it — that
+   touches the build, so it needs an explicit ask.
+4. Optional: a small integration test for the upload → filter → answer path, so the filename filter is covered
    without a live embedder (the current tests fake `ChatClient`, so filter-expression correctness is only
    exercised against a real model).
-3. Optional: `src/main/resources/docs/` holds one policy file; a second fixture would make filtered-RAG
-   examples clearer in the README without asking users to upload first.
-4. Consider a local model upgrade if factual answers matter more than staying offline.
-5. `ARCHITECTURE_AND_METHODS.md` and `README.md` were rewritten to 1.1.8 on 2026-09-30. If the version moves
-   again, the rows in its §8 migration table are the places that rot first.
+5. Optional: `src/main/resources/docs/` holds one policy file; a second fixture would make filtered-RAG
+   examples clearer without asking users to upload first.
+6. Consider a local model upgrade if factual answers matter more than staying offline.
+7. `ARCHITECTURE_AND_METHODS.md`, `README.md` and `docs/GETTING_STARTED.md` were rewritten against 1.1.8 on
+   2026-09-30 — every quoted sample in them was produced by running the command in this repo's shell that day,
+   so the scores carry the drift noted in §Traps. If the version moves again, the rows in
+   `ARCHITECTURE_AND_METHODS.md` §8 (migration table) and the step outputs in `GETTING_STARTED.md` are the
+   places that rot first.

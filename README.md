@@ -12,6 +12,10 @@ Any OpenAI-protocol backend works — local Ollama, LM Studio, llama.cpp's serve
 in the code is model-specific, but every sample output below was produced by `qwen2.5:0.5b-instruct`, so read
 §Known limits before judging the answers.
 
+> **New to Spring AI?** Start with **[docs/GETTING_STARTED.md](docs/GETTING_STARTED.md)** — prerequisites, a
+> plain-language glossary, and a five-step guided tour that runs every capability in learning order. This file
+> is the reference; that file is the on-ramp.
+
 ---
 
 ## 🚀 Quick start (local Ollama — the mode every example here was run in)
@@ -271,6 +275,18 @@ with the offending text, so the failure is diagnosable instead of a silent `null
   "conversionFailure": "...", "rawModelOutput": "...", "requestId": "9d9b3cd3" }
 ```
 
+`conversionFailure` is present only when the text will not bind onto the record at all; a well-formed object
+with a blank field is rejected by the endpoint's own completeness predicate, and then the body quotes the model
+verbatim — this is a real response from `?genre=Cyberpunk`, so note that **the endpoint alternates between the
+200 above and this** depending on whether the model leaves `director` empty:
+
+```json
+{ "error": "model_output_unparseable", "status": 422,
+  "detail": "Model response did not contain a complete MovieRecommendation object",
+  "requestId": "44dddd44",
+  "rawModelOutput": "{ \"director\": \"\", \"genre\": \"Cyberpunk\", \"imdbRating\": 8.5, \"keyActors\": [\"Tom Holland\", \"Ewan McGregor\"], \"releaseYear\": 2017, \"summary\": \"A young man, played by Tom Holland, is recruited to infiltrate a cyberpunk society and uncover its secrets.\", \"title\": \"Inception\" }" }
+```
+
 ### 6. Retrieval-Augmented Generation
 `POST /api/ai/rag/query` — body `{ "question": "...", "topK": 2, "filename": "..." }` (`topK` 0 means the
 configured default; `filename` is an optional metadata filter).
@@ -298,7 +314,10 @@ differently. That also means an empty `sourceDocuments` is honest: nothing clear
 `app.rag.similarity-threshold` (0.2), so the model answered without context. Filtered queries hit this often —
 `{"question": "failover window", "filename": "ops-runbook.md"}` scored the right chunk at 0.08 and correctly
 returned no citations. Run `/rag/search` with the same query and filename to see the score the threshold
-rejected.
+rejected. Scores are not bit-stable with a local embedder: the same query can read 0.1176 on one run and 0.1228
+on the next, so treat the third decimal as noise. **`answer` is not reproducible either** — the same request
+with the same chunk cited at 0.60 answered the stipend correctly on one call and claimed "You haven't mentioned
+any specific instance of a home office equipment stipend" on the next. Trust `sourceDocuments`, not the prose.
 
 #### Raw vector similarity search
 `GET /api/ai/rag/search?query=...&topK=...&filename=...`
@@ -316,8 +335,8 @@ when nothing matches, `totalResults: 0` arrives with a `note` explaining that th
 the multipart cap is 1 MB).
 
 ```bash
-printf '# Ops Runbook\n\nDatabase failover is approved for 02:00-04:00 UTC only.\n' > ops-runbook.md
-curl -X POST http://localhost:8080/api/ai/rag/documents -F "file=@ops-runbook.md"
+printf '# Ops Runbook\n\nDatabase failover is approved for 02:00-04:00 UTC only.\n' > target/ops-runbook.md
+curl -X POST http://localhost:8080/api/ai/rag/documents -F "file=@target/ops-runbook.md"
 curl "http://localhost:8080/api/ai/rag/search?query=failover&topK=2&filename=ops-runbook.md"
 ```
 ```json
