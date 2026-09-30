@@ -5,6 +5,6 @@ import java.util.List;
 public record RagQueryResponse(
         String question,
         String answer,
-        List<String> sourceDocuments,
+        List<RetrievedChunk> sourceDocuments,
         long responseTimeMs
 ) {}

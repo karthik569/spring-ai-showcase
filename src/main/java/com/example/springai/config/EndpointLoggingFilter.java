@@ -16,6 +16,8 @@ import org.springframework.web.util.ContentCachingResponseWrapper;
 import java.io.IOException;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 
 @Component
@@ -25,6 +27,22 @@ public class EndpointLoggingFilter extends OncePerRequestFilter implements Order
     private static final String REQUEST_ID_HEADER = "X-Request-Id";
     private static final Logger ACCESS_LOG = LoggerFactory.getLogger("ENDPOINT_ACCESS");
     private static final int MAX_BODY_CHARS = 2000;
+
+    // The unbounded ContentCachingRequestWrapper constructor is deprecated for removal, and buffering a
+    // whole multipart upload in heap to log its first 2000 characters is not a trade worth making.
+    private static final int MAX_CACHE_BYTES = 8 * 1024;
+
+    // Docs, metrics and page assets are not AI calls: caching the multi-megabyte OpenAPI document just to
+    // log a truncated copy of it would pollute endpoints.log and hide the requests worth reading.
+    private static final List<String> UNLOGGED_PREFIXES = List.of("/actuator", "/v3/api-docs", "/swagger-ui", "/docs", "/webjars");
+    private static final Set<String> UNLOGGED_PATHS = Set.of("/", "/index.html", "/favicon.ico");
+
+    @Override
+    protected boolean shouldNotFilter(HttpServletRequest request) {
+        String path = request.getRequestURI().substring(request.getContextPath().length());
+        return UNLOGGED_PATHS.contains(path)
+                || UNLOGGED_PREFIXES.stream().anyMatch(prefix -> path.equals(prefix) || path.startsWith(prefix + "/"));
+    }
 
     @Override
     public int getOrder() {
@@ -47,7 +65,9 @@ public class EndpointLoggingFilter extends OncePerRequestFilter implements Order
         long startedAt = System.nanoTime();
         // Buffering a streamed response behind the caching wrapper would delay every token until the stream ends.
         boolean streaming = isStreaming(request);
-        HttpServletRequest loggedRequest = streaming ? request : new ContentCachingRequestWrapper(request);
+        HttpServletRequest loggedRequest = streaming
+                ? request
+                : new ContentCachingRequestWrapper(request, MAX_CACHE_BYTES);
         HttpServletResponse loggedResponse = streaming ? response : new ContentCachingResponseWrapper(response);
 
         try {

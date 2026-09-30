@@ -1,0 +1,474 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Spring AI Showcase</title>
+<style>
+    :root {
+        --bg: #0f1115;
+        --panel: #171a21;
+        --line: #262b36;
+        --text: #dfe4ec;
+        --muted: #8b95a7;
+        --accent: #6ea8fe;
+        --ok: #5ec97b;
+        --bad: #f2695f;
+    }
+    * { box-sizing: border-box; }
+    body {
+        margin: 0;
+        padding: 24px;
+        background: var(--bg);
+        color: var(--text);
+        font: 14px/1.5 system-ui, "Segoe UI", Roboto, sans-serif;
+    }
+    header { margin-bottom: 20px; }
+    h1 { margin: 0 0 4px; font-size: 22px; }
+    header p { margin: 0; color: var(--muted); }
+    header a { color: var(--accent); }
+    .grid {
+        display: grid;
+        gap: 16px;
+        grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+        align-items: start;
+    }
+    section {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 14px 16px 16px;
+    }
+    h2 { margin: 0 0 2px; font-size: 15px; }
+    .note { margin: 0 0 10px; color: var(--muted); font-size: 12px; }
+    label { display: block; margin: 8px 0 3px; font-size: 12px; color: var(--muted); }
+    input, textarea, select, button {
+        font: inherit;
+        width: 100%;
+        padding: 7px 9px;
+        border-radius: 6px;
+        border: 1px solid var(--line);
+        background: #10131a;
+        color: var(--text);
+    }
+    textarea { resize: vertical; min-height: 58px; }
+    button {
+        margin-top: 10px;
+        background: #22304a;
+        border-color: #33456b;
+        color: #cfe0ff;
+        cursor: pointer;
+    }
+    button:hover { background: #2a3a59; }
+    button:disabled { opacity: .55; cursor: default; }
+    .row { display: flex; gap: 8px; }
+    .row button { margin-top: 10px; }
+    pre {
+        margin: 10px 0 0;
+        padding: 9px;
+        background: #10131a;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        white-space: pre-wrap;
+        word-break: break-word;
+        max-height: 260px;
+        overflow: auto;
+        min-height: 34px;
+    }
+    .status { font-size: 12px; margin-top: 8px; color: var(--muted); }
+    .status.ok { color: var(--ok); }
+    .status.bad { color: var(--bad); }
+    details { margin-top: 8px; }
+    summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+    .cites { margin-top: 10px; display: grid; gap: 6px; }
+    .cite {
+        border: 1px solid var(--line);
+        border-left: 3px solid var(--accent);
+        border-radius: 6px;
+        padding: 7px 9px;
+        background: #10131a;
+        font-size: 12px;
+    }
+    .cite b { color: var(--accent); font-weight: 600; }
+    .turn { border-left: 3px solid #33456b; margin: 0 0 8px; padding-left: 9px; font-size: 12px; }
+    .turn span { color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+    <h1>Spring AI Showcase</h1>
+    <p>Spring AI 1.1.8 · Spring Boot 3.5.16 · endpoints under <code>/api/ai/**</code> ·
+        <a href="/docs">Swagger UI</a> · <a href="/actuator/health">health</a></p>
+</header>
+
+<div class="grid">
+    <section>
+        <h2>Simple chat</h2>
+        <p class="note">One-shot completion from the stateless client — no conversation is stored.</p>
+        <label for="chatMessage">Prompt</label>
+        <textarea id="chatMessage">Explain the advantages of Spring Boot 3 in 2 sentences</textarea>
+        <button data-run="chat">Send</button>
+        <div class="status" hidden></div>
+        <pre hidden></pre>
+        <details hidden><summary>raw response</summary><pre class="raw"></pre></details>
+    </section>
+
+    <section>
+        <h2>Templated prompt</h2>
+        <p class="note">System and user templates resolved from request parameters.</p>
+        <label for="tplRole">Role</label>
+        <input id="tplRole" value="Software Engineer">
+        <label for="tplTopic">Topic</label>
+        <input id="tplTopic" value="Explain Dependency Injection">
+        <button data-run="template">Explain</button>
+        <div class="status" hidden></div>
+        <pre hidden></pre>
+        <details hidden><summary>raw response</summary><pre class="raw"></pre></details>
+    </section>
+
+    <section>
+        <h2>Streaming</h2>
+        <p class="note">Server-sent events, appended as they arrive. Uses the memory client, so the
+            conversation id below is recalled by later turns.</p>
+        <label for="streamMessage">Prompt</label>
+        <textarea id="streamMessage">Write a haiku about Java programming</textarea>
+        <div class="row">
+            <button data-run="stream">Stream</button>
+            <button data-run="streamStop" disabled>Stop</button>
+        </div>
+        <div class="status" hidden></div>
+        <pre hidden></pre>
+    </section>
+
+    <section>
+        <h2>Chat memory</h2>
+        <p class="note">Windowed history persisted in H2 through <code>MessageChatMemoryAdvisor</code>. Ids
+            are capped at 36 characters by the shipped schema.</p>
+        <label for="memConv">Conversation id</label>
+        <input id="memConv" value="demo-1">
+        <label for="memMessage">Message</label>
+        <textarea id="memMessage">My name is Karthik and I deploy with Maven</textarea>
+        <div class="row">
+            <button data-run="memory">Send</button>
+            <button data-run="history">History</button>
+            <button data-run="clear">Clear</button>
+        </div>
+        <div class="status" hidden></div>
+        <pre hidden></pre>
+        <details hidden><summary>raw response</summary><pre class="raw"></pre></details>
+    </section>
+
+    <section>
+        <h2>Tool calling</h2>
+        <p class="note">The model decides whether to call the registered function; check
+            <code>[SPRING-AI-TOOL]</code> lines in <code>logs/app.log</code> to confirm it did.</p>
+        <label for="toolMode">Endpoint</label>
+        <select id="toolMode">
+            <option value="weather">weather tool</option>
+            <option value="order">order tool</option>
+            <option value="multi">both tools</option>
+        </select>
+        <label for="toolPrompt">Prompt</label>
+        <textarea id="toolPrompt">What is the weather like in Tokyo right now?</textarea>
+        <button data-run="tools">Run</button>
+        <div class="status" hidden></div>
+        <pre hidden></pre>
+        <details hidden><summary>raw response</summary><pre class="raw"></pre></details>
+    </section>
+
+    <section>
+        <h2>Structured output</h2>
+        <p class="note">Schema-constrained generation. An incomplete answer is retried and reported as
+            HTTP 422 rather than silently returned.</p>
+        <label for="movieGenre">Genre</label>
+        <input id="movieGenre" value="Sci-Fi">
+        <button data-run="movie">Recommend a film</button>
+        <div class="status" hidden></div>
+        <pre hidden></pre>
+        <details hidden><summary>raw response</summary><pre class="raw"></pre></details>
+    </section>
+
+    <section>
+        <h2>RAG query</h2>
+        <p class="note">Retrieval-augmented answer with the exact chunks the model was given, and their
+            cosine scores.</p>
+        <label for="ragQuestion">Question</label>
+        <textarea id="ragQuestion">What is the PTO policy?</textarea>
+        <label for="ragFile">Restrict to filename (optional)</label>
+        <input id="ragFile" placeholder="company-policy.md">
+        <button data-run="rag">Ask</button>
+        <div class="status" hidden></div>
+        <pre hidden></pre>
+        <div class="cites"></div>
+        <details hidden><summary>raw response</summary><pre class="raw"></pre></details>
+    </section>
+
+    <section>
+        <h2>Vector search</h2>
+        <p class="note">Raw similarity match, bypassing the model. Top K of 0 lowers the floor to pure
+            ranking.</p>
+        <label for="searchQuery">Query</label>
+        <input id="searchQuery" value="annual leave">
+        <div class="row">
+            <label style="flex:1">
+                Top K
+                <input id="searchTopK" type="number" value="3" min="0" max="20">
+            </label>
+            <label style="flex:2">
+                Filename filter
+                <input id="searchFile" placeholder="company-policy.md">
+            </label>
+        </div>
+        <button data-run="search">Search</button>
+        <div class="status" hidden></div>
+        <pre hidden></pre>
+        <details hidden><summary>raw response</summary><pre class="raw"></pre></details>
+    </section>
+
+    <section>
+        <h2>Index a document</h2>
+        <p class="note">Plain-text upload, chunked and embedded. Re-uploading a name replaces its chunks.
+            Limit 1 MB per file.</p>
+    <label for="docFile">File</label>
+    <input id="docFile" type="file" accept=".txt,.md,.csv,.json,.log,text/plain">
+        <button data-run="upload">Upload</button>
+        <div class="status" hidden></div>
+        <pre hidden></pre>
+        <details hidden><summary>raw response</summary><pre class="raw"></pre></details>
+    </section>
+
+    <section>
+        <h2>Image analysis</h2>
+        <p class="note">The server fetches the URL and refuses loopback, private and link-local addresses.
+            Needs a vision-capable model in OPENAI_MODEL.</p>
+        <label for="visionUrl">Image URL</label>
+        <input id="visionUrl" value="https://spring.io/favicon.ico">
+        <label for="visionQuestion">Question</label>
+        <input id="visionQuestion" value="What does this image show?">
+        <button data-run="vision">Analyse</button>
+        <div class="status" hidden></div>
+        <pre hidden></pre>
+        <details hidden><summary>raw response</summary><pre class="raw"></pre></details>
+    </section>
+</div>
+
+<script>
+    const state = { source: null };
+
+    const panelOf = (button) => button.closest('section');
+    const value = (id) => document.getElementById(id).value.trim();
+
+    function status(section, text, cls) {
+        const el = section.querySelector('.status');
+        el.textContent = text;
+        el.className = 'status ' + (cls || '');
+        el.hidden = false;
+    }
+
+    function show(section, payload) {
+        const out = section.querySelector('pre:not([class])');
+        const details = section.querySelector('details');
+        const text = typeof payload === 'string' ? payload : JSON.stringify(payload, null, 2);
+        const answer = payload && typeof payload === 'object'
+            ? (payload.response || payload.answer || payload.explanation || payload.analysis || null)
+            : null;
+
+        out.textContent = answer !== null ? answer : text;
+        out.hidden = false;
+
+        // Fill the raw dump even when the panel hides it: the transcript view reads it back from here.
+        details.querySelector('.raw').textContent = text;
+        details.hidden = answer === null;
+
+        if (payload && Array.isArray(payload.sourceDocuments)) {
+            renderCitations(section, payload.sourceDocuments);
+        }
+    }
+
+    function renderCitations(section, chunks) {
+        const box = section.querySelector('.cites');
+        if (!box) return;
+        box.innerHTML = '';
+        chunks.forEach((chunk) => {
+            const row = document.createElement('div');
+            row.className = 'cite';
+            const score = typeof chunk.score === 'number' ? chunk.score.toFixed(3) : 'n/a';
+            row.innerHTML = '<b>' + escapeHtml(chunk.filename || 'unknown') + '</b> · cosine ' + score
+                + '<br>' + escapeHtml(chunk.excerpt || '');
+            box.appendChild(row);
+        });
+    }
+
+    function escapeHtml(s) {
+        return String(s).replace(/[&<>"]/g, (c) => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c]));
+    }
+
+    async function call(section, url, options) {
+        const buttons = section.querySelectorAll('button');
+        buttons.forEach((b) => { if (b.dataset.run !== 'streamStop') b.disabled = true; });
+        const cites = section.querySelector('.cites');
+        if (cites) cites.innerHTML = '';
+        status(section, 'requesting …');
+        try {
+            const response = await fetch(url, options);
+            const id = response.headers.get('X-Request-Id');
+            const body = await readJson(response);
+            show(section, body);
+            status(section,
+                (response.ok ? 'HTTP ' : 'HTTP ') + response.status + (id ? ' · requestId ' + id : ''),
+                response.ok ? 'ok' : 'bad');
+            if (!response.ok) {
+                status(section, 'HTTP ' + response.status + (id ? ' · requestId ' + id : '')
+                    + ' · ' + (body && body.detail ? body.detail : 'see raw response'), 'bad');
+            }
+        } catch (err) {
+            status(section, err.name + ': ' + err.message, 'bad');
+        } finally {
+            buttons.forEach((b) => { if (b.dataset.run !== 'streamStop') b.disabled = false; });
+        }
+    }
+
+    async function readJson(response) {
+        const text = await response.text();
+        try {
+            return JSON.parse(text);
+        } catch (_) {
+            return text;
+        }
+    }
+
+    const actions = {
+        chat: (s) => call(s, '/api/ai/chat?message=' + encodeURIComponent(value('chatMessage'))),
+        template: (s) => call(s, '/api/ai/chat/template?role=' + encodeURIComponent(value('tplRole'))
+            + '&topic=' + encodeURIComponent(value('tplTopic'))),
+        memory: (s) => call(s, '/api/ai/chat/memory?conversationId=' + encodeURIComponent(value('memConv'))
+            + '&message=' + encodeURIComponent(value('memMessage'))),
+        history: async (s) => {
+            await call(s, '/api/ai/chat/memory/history?conversationId=' + encodeURIComponent(value('memConv')));
+            renderTranscript(s);
+        },
+        clear: (s) => call(s, '/api/ai/chat/memory?conversationId=' + encodeURIComponent(value('memConv')),
+            { method: 'DELETE' }),
+        tools: (s) => {
+            const mode = value('toolMode');
+            const prompts = {
+                weather: 'What is the weather like in Tokyo right now?',
+                order: 'Can you give me the shipping status for order ORD-101?',
+                multi: 'Check the weather in London, and also check the delivery status of order ORD-103.'
+            };
+            const prompt = document.getElementById('toolPrompt').value.trim() || prompts[mode];
+            return call(s, '/api/ai/tools/' + mode + '?prompt=' + encodeURIComponent(prompt));
+        },
+        movie: (s) => call(s, '/api/ai/structured/movie?genre=' + encodeURIComponent(value('movieGenre'))),
+        rag: (s) => {
+            const body = { question: value('ragQuestion'), topK: 4 };
+            if (value('ragFile')) body.filename = value('ragFile');
+            return call(s, '/api/ai/rag/query', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body)
+            });
+        },
+        search: (s) => {
+            const params = new URLSearchParams({ query: value('searchQuery'), topK: value('searchTopK') || '3' });
+            if (value('searchFile')) params.set('filename', value('searchFile'));
+            return call(s, '/api/ai/rag/search?' + params);
+        },
+        upload: (s) => {
+            const input = document.getElementById('docFile');
+            if (!input.files.length) {
+                status(s, 'choose a file first', 'bad');
+                return Promise.resolve();
+            }
+            const form = new FormData();
+            form.append('file', input.files[0]);
+            return call(s, '/api/ai/rag/documents', { method: 'POST', body: form });
+        },
+        vision: (s) => call(s, '/api/ai/vision/analyze?imageUrl=' + encodeURIComponent(value('visionUrl'))
+            + '&question=' + encodeURIComponent(value('visionQuestion'))),
+        stream: (s) => startStream(s),
+        streamStop: () => stopStream()
+    };
+
+    function startStream(section) {
+        stopStream();
+        const out = section.querySelector('pre:not([class])');
+        out.hidden = false;
+        out.textContent = '';
+        section.querySelectorAll('button').forEach((b) => {
+            b.disabled = b.dataset.run !== 'streamStop';
+        });
+        status(section, 'streaming …');
+
+        const url = '/api/ai/chat/stream?conversationId=' + encodeURIComponent(value('memConv'))
+            + '&message=' + encodeURIComponent(value('streamMessage'));
+        const source = new EventSource(url);
+        state.source = source;
+        let tokens = 0;
+
+        source.onmessage = (event) => {
+            // Spring encodes a newline token as an empty data: line, so empty means "break the line".
+            out.textContent += event.data === '' ? '\n' : event.data;
+            out.scrollTop = out.scrollHeight;
+            tokens++;
+            status(section, 'streaming … ' + tokens + ' chunks', 'ok');
+        };
+        source.onerror = () => {
+            source.close();
+            state.source = null;
+            section.querySelectorAll('button').forEach((b) => { b.disabled = false; });
+            section.querySelector('[data-run="streamStop"]').disabled = true;
+            status(section, 'closed after ' + tokens + ' chunks', 'ok');
+        };
+    }
+
+    function stopStream() {
+        if (state.source) {
+            state.source.close();
+            state.source = null;
+        }
+        document.querySelectorAll('[data-run="streamStop"]').forEach((b) => { b.disabled = true; });
+        document.querySelectorAll('[data-run="stream"]').forEach((b) => { b.disabled = false; });
+    }
+
+    // The history endpoint answers with a transcript object; redraw it as labelled turns.
+    function renderTranscript(section) {
+        const raw = section.querySelector('details .raw');
+        let payload;
+        try {
+            payload = JSON.parse(raw.textContent);
+        } catch (_) {
+            return;
+        }
+        if (!payload || !Array.isArray(payload.messages)) return;
+        // The labelled turns replace the JSON block; the raw dump stays available under "raw response".
+        section.querySelector('pre:not([class])').hidden = true;
+        section.querySelector('details').hidden = false;
+        const box = section.querySelector('.cites') || appendCitesBox(section);
+        box.innerHTML = '';
+        payload.messages.forEach((turn) => {
+            const row = document.createElement('div');
+            row.className = 'turn';
+            row.innerHTML = '<span>' + escapeHtml(turn.role) + '</span><br>' + escapeHtml(turn.content);
+            box.appendChild(row);
+        });
+    }
+
+    function appendCitesBox(section) {
+        const box = document.createElement('div');
+        box.className = 'cites';
+        section.appendChild(box);
+        return box;
+    }
+
+    document.querySelectorAll('button[data-run]').forEach((button) => {
+        button.addEventListener('click', () => {
+            const action = actions[button.dataset.run];
+            if (action) action(panelOf(button));
+        });
+    });
+
+    window.addEventListener('beforeunload', stopStream);
+</script>
+</body>
+</html>

@@ -35,4 +35,6 @@ target/
 *.env
 *.log
 /logs/
+# H2 file database backing the persisted chat memory
+/data/
 .DS_Store

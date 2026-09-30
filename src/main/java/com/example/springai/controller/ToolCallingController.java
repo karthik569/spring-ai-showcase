@@ -14,13 +14,11 @@ public class ToolCallingController {
 
     private static final Logger log = LoggerFactory.getLogger(ToolCallingController.class);
 
-    // Spring AI 1.0.0-M4 has no path from OpenAiChatOptions.getToolChoice() to ChatCompletionRequest, so
-    // withToolChoice("required") is dropped before the request leaves the JVM even though Ollama honours it
-    // when posted directly. Whether a tool runs is therefore the model's decision; 0.2 is the temperature at
-    // which qwen2.5:0.5b called both tools in most tests, while 0.0 stopped calling them and an "answer only
-    // from the tool result" system prompt made the model describe the tool instead of using it.
+    // Whether a tool runs is the model's decision here: 0.2 is the temperature at which qwen2.5:0.5b called
+    // both tools in most tests, while 0.0 stopped calling them and an "answer only from the tool result"
+    // system prompt made the model describe the tool instead of using it.
     private static final OpenAiChatOptions LOW_TEMPERATURE = OpenAiChatOptions.builder()
-            .withTemperature(0.2)
+            .temperature(0.2)
             .build();
 
     private final ChatClient chatClient;
@@ -33,7 +31,7 @@ public class ToolCallingController {
     public Map<String, String> queryWeather(@RequestParam(defaultValue = "What is the weather like in Tokyo right now?") String prompt) {
         String answer = chatClient.prompt()
                 .user(prompt)
-                .functions("getCurrentWeather")
+                .toolNames("getCurrentWeather")
                 .options(LOW_TEMPERATURE)
                 .call()
                 .content();
@@ -45,7 +43,7 @@ public class ToolCallingController {
     public Map<String, String> queryOrder(@RequestParam(defaultValue = "Can you give me the shipping status for order ORD-101?") String prompt) {
         String answer = chatClient.prompt()
                 .user(prompt)
-                .functions("getOrderStatus")
+                .toolNames("getOrderStatus")
                 .options(LOW_TEMPERATURE)
                 .call()
                 .content();
@@ -58,7 +56,7 @@ public class ToolCallingController {
             @RequestParam(defaultValue = "Check the weather in London, and also check the delivery status of order ORD-103.") String prompt) {
         String answer = chatClient.prompt()
                 .user(prompt)
-                .functions("getCurrentWeather", "getOrderStatus")
+                .toolNames("getCurrentWeather", "getOrderStatus")
                 .call()
                 .content();
 

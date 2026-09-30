@@ -2,7 +2,7 @@ package com.example.springai.controller;
 
 import com.example.springai.error.ImageDownloadException;
 import org.springframework.ai.chat.client.ChatClient;
-import org.springframework.ai.model.Media;
+import org.springframework.ai.content.Media;
 import org.springframework.core.io.ByteArrayResource;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;

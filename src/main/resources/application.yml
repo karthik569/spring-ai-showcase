@@ -2,9 +2,32 @@ server:
   port: 8080
 
 spring:
+  http:
+    client:
+      # Without these, a wedged Ollama process holds a request thread open for the container default, and a
+      # browser tab streaming tokens can sit on a half-dead connection indefinitely.
+      connect-timeout: 5s
+      read-timeout: ${LLM_READ_TIMEOUT:90s}
   application:
     name: spring-ai-showcase
+  datasource:
+    # Conversations outlive the process; drop to jdbc:h2:mem: for a throwaway store.
+    url: ${CHAT_MEMORY_JDBC_URL:jdbc:h2:file:./data/chat-memory}
+    username: ${CHAT_MEMORY_JDBC_USERNAME:sa}
+    password: ${CHAT_MEMORY_JDBC_PASSWORD:}
+    driver-class-name: org.h2.Driver
+  servlet:
+    multipart:
+      max-file-size: 1MB
+      max-request-size: 2MB
   ai:
+    chat:
+      memory:
+        repository:
+          jdbc:
+            # The shipped H2 script has no IF NOT EXISTS; the initializer runs it with continue-on-error,
+            # so a second boot against the same file keeps its rows instead of failing on a duplicate table.
+            initialize-schema: always
     retry:
       max-attempts: 2
       backoff:
@@ -22,15 +45,30 @@ spring:
           # model used as the vectorizer produces near-random cosine scores, so short queries match nothing.
           model: ${OPENAI_EMBEDDING_MODEL:all-minilm}
 
+springdoc:
+  swagger-ui:
+    # Not the default /swagger-ui.html and not /: a UI mounted at the root would collide with the demo
+    # page, which is served as the static welcome page from src/main/resources/static/index.html.
+    path: /docs
+  api-docs:
+    path: /v3/api-docs
+
 logging:
   directory: logs
   level:
     ENDPOINT_ACCESS: INFO
     # Spring AI's retry interceptor prints a full stack for every failed attempt; GlobalExceptionHandler
-    # already reports the root cause once per request, with the requestId to correlate it.
-    org.springframework.ai.autoconfigure.retry: ERROR
+    # already reports the root cause once per request, with the requestId to correlate it. The package
+    # was renamed from org.springframework.ai.autoconfigure.retry when the autoconfigure module merged.
+    org.springframework.ai.retry.autoconfigure: ERROR
 
 app:
+  ai:
+    # Ceiling on simultaneous model calls; extra requests get an immediate 503 rather than queueing unseen.
+    max-concurrent-requests: 4
+  health:
+    llm:
+      cache-ttl: 30s
   rag:
     # Read by RagController: threshold applies to the grounded /query path only.
     # all-minilm cosine for a relevant short question against these chunks lands around 0.3-0.45, so a
@@ -43,3 +81,7 @@ management:
     web:
       exposure:
         include: health,info,metrics
+  endpoint:
+    health:
+      # The llm indicator's model name and probe latency are the reason it exists.
+      show-details: always

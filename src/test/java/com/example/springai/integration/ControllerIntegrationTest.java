@@ -1,24 +1,37 @@
 package com.example.springai.integration;
 
 import com.example.springai.controller.ChatController;
+import com.example.springai.controller.RagController;
 import com.example.springai.controller.StructuredOutputController;
 import com.example.springai.controller.ToolCallingController;
 import com.example.springai.dto.MovieRecommendation;
+import com.example.springai.error.GlobalExceptionHandler;
+import com.example.springai.service.RagDocumentIngestionService;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.chat.client.ChatClientResponse;
+import org.springframework.ai.chat.client.ResponseEntity;
+import org.springframework.ai.chat.client.advisor.vectorstore.QuestionAnswerAdvisor;
+import org.springframework.ai.chat.memory.ChatMemory;
+import org.springframework.ai.chat.memory.InMemoryChatMemoryRepository;
+import org.springframework.ai.chat.memory.MessageWindowChatMemory;
 import org.springframework.ai.chat.messages.AssistantMessage;
 import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.ai.chat.model.Generation;
+import org.springframework.ai.document.Document;
+import org.springframework.ai.vectorstore.VectorStore;
 import org.springframework.http.MediaType;
+import org.springframework.mock.web.MockMultipartFile;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 
 import java.lang.reflect.Proxy;
 import java.util.List;
+import java.util.Map;
 
-import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
 
 class ControllerIntegrationTest {
@@ -26,7 +39,7 @@ class ControllerIntegrationTest {
     @Test
     void testChatControllerStandalone() throws Exception {
         ChatClient fakeChatClient = createFakeChatClient("Spring AI simplifies generative AI integration.");
-        ChatController chatController = new ChatController(fakeChatClient);
+        ChatController chatController = new ChatController(fakeChatClient, fakeChatClient, inMemoryChatMemory());
         MockMvc mockMvc = MockMvcBuilders.standaloneSetup(chatController).build();
 
         mockMvc.perform(get("/api/ai/chat")
@@ -35,6 +48,22 @@ class ControllerIntegrationTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.prompt").value("What is Spring AI?"))
                 .andExpect(jsonPath("$.response").value("Spring AI simplifies generative AI integration."));
+    }
+
+    @Test
+    void testConversationIdLongerThanTheSchemaColumnIsRejected() throws Exception {
+        ChatClient fakeChatClient = createFakeChatClient("unused");
+        ChatController controller = new ChatController(fakeChatClient, fakeChatClient, inMemoryChatMemory());
+        MockMvc mockMvc = MockMvcBuilders.standaloneSetup(controller)
+                .setControllerAdvice(new GlobalExceptionHandler())
+                .build();
+
+        // VARCHAR(36) in the chat memory schema: without this the failure surfaces as a JDBC insert error.
+        mockMvc.perform(get("/api/ai/chat/memory")
+                        .param("message", "hi")
+                        .param("conversationId", "this-conversation-identifier-is-definitely-longer-than-thirty-six-characters"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("request_rejected"));
     }
 
     @Test
@@ -70,34 +99,128 @@ class ControllerIntegrationTest {
                 .andExpect(jsonPath("$.response").value("The weather in Tokyo is 18.5°C and partly cloudy."));
     }
 
+    // Provenance is read from what the advisor actually retrieved, never from a second search.
+    @Test
+    void testRagQueryReportsTheChunksTheAdvisorRetrieved() throws Exception {
+        Document chunk = Document.builder()
+                .id("chunk-1")
+                .text("Employees receive 25 days of annual leave.")
+                .metadata(Map.of("filename", "policy.md"))
+                .score(0.42)
+                .build();
+        ChatClient fakeChatClient = createFakeChatClient("You get 25 days.", Map.of(
+                QuestionAnswerAdvisor.RETRIEVED_DOCUMENTS, List.of(chunk)));
+
+        RagController controller = new RagController(createFakeBuilder(fakeChatClient), unusedVectorStore(),
+                new RagDocumentIngestionService(unusedVectorStore()), 4, 0.2);
+        MockMvc mockMvc = MockMvcBuilders.standaloneSetup(controller).build();
+
+        mockMvc.perform(post("/api/ai/rag/query")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"question\":\"How many leave days?\",\"topK\":2}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.answer").value("You get 25 days."))
+                .andExpect(jsonPath("$.sourceDocuments[0].filename").value("policy.md"))
+                .andExpect(jsonPath("$.sourceDocuments[0].score").value(0.42));
+    }
+
+    @Test
+    void testRagQueryRejectsABlankQuestion() throws Exception {
+        RagController controller = new RagController(createFakeBuilder(createFakeChatClient("x", Map.of())),
+                unusedVectorStore(), new RagDocumentIngestionService(unusedVectorStore()), 4, 0.2);
+        MockMvc mockMvc = MockMvcBuilders.standaloneSetup(controller)
+                .setControllerAdvice(new GlobalExceptionHandler())
+                .build();
+
+        // Before validation this reached Spring AI as a null query and came back as a message-less 500.
+        mockMvc.perform(post("/api/ai/rag/query")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("invalid_request"));
+    }
+
+    @Test
+    void testRagUploadRejectsAFileNameThatCouldBreakAFilterExpression() throws Exception {
+        RagController controller = new RagController(createFakeBuilder(createFakeChatClient("x", Map.of())),
+                unusedVectorStore(), new RagDocumentIngestionService(unusedVectorStore()), 4, 0.2);
+        MockMvc mockMvc = MockMvcBuilders.standaloneSetup(controller)
+                .setControllerAdvice(new GlobalExceptionHandler())
+                .build();
+
+        MockMultipartFile hostile = new MockMultipartFile("file", "policy' || 1==1 || '.md",
+                "text/markdown", "# Policy".getBytes());
+
+        mockMvc.perform(multipart("/api/ai/rag/documents").file(hostile))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("request_rejected"));
+    }
+
+    @Test
+    void testRagUploadIndexesAPlaintextDocument() throws Exception {
+        RagController controller = new RagController(createFakeBuilder(createFakeChatClient("x", Map.of())),
+                unusedVectorStore(), new RagDocumentIngestionService(unusedVectorStore()), 4, 0.2);
+        MockMvc mockMvc = MockMvcBuilders.standaloneSetup(controller).build();
+
+        MockMultipartFile document = new MockMultipartFile("file", "runbook.md", "text/markdown",
+                ("# On-call runbook\n\nRestart the gateway before draining traffic.\n\n"
+                        + "## Escalation\n\nPage the secondary owner after fifteen minutes.").getBytes());
+
+        mockMvc.perform(multipart("/api/ai/rag/documents").file(document))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.filename").value("runbook.md"))
+                .andExpect(jsonPath("$.chunks").value(org.hamcrest.Matchers.greaterThan(0)));
+    }
+
+    private static ChatMemory inMemoryChatMemory() {
+        return MessageWindowChatMemory.builder()
+                .chatMemoryRepository(new InMemoryChatMemoryRepository())
+                .maxMessages(6)
+                .build();
+    }
+
     private static ChatClient createFakeChatClient(Object responsePayload) {
+        return createFakeChatClient(responsePayload, Map.of());
+    }
+
+    private static ChatClient createFakeChatClient(Object responsePayload, Map<String, Object> responseContext) {
         return (ChatClient) Proxy.newProxyInstance(
                 ChatClient.class.getClassLoader(),
                 new Class<?>[]{ChatClient.class},
-                (proxy, method, args) -> {
-                    if ("prompt".equals(method.getName())) {
-                        return createFakeRequestSpec(responsePayload);
-                    }
-                    return null;
-                }
+                (proxy, method, args) -> "prompt".equals(method.getName())
+                        ? createFakeRequestSpec(responsePayload, responseContext)
+                        : null
         );
     }
 
-    private static Object createFakeRequestSpec(Object responsePayload) {
+    private static ChatClient.Builder createFakeBuilder(ChatClient chatClient) {
+        return (ChatClient.Builder) Proxy.newProxyInstance(
+                ChatClient.Builder.class.getClassLoader(),
+                new Class<?>[]{ChatClient.Builder.class},
+                (proxy, method, args) -> "build".equals(method.getName()) ? chatClient : proxy
+        );
+    }
+
+    private static VectorStore unusedVectorStore() {
+        return (VectorStore) Proxy.newProxyInstance(
+                VectorStore.class.getClassLoader(),
+                new Class<?>[]{VectorStore.class},
+                (proxy, method, args) -> null
+        );
+    }
+
+    private static Object createFakeRequestSpec(Object responsePayload, Map<String, Object> responseContext) {
         return Proxy.newProxyInstance(
                 ChatClient.class.getClassLoader(),
                 new Class<?>[]{ChatClient.ChatClientRequestSpec.class},
-                (proxy, method, args) -> {
-                    if ("call".equals(method.getName())) {
-                        return createFakeCallResponseSpec(responsePayload);
-                    }
-                    // Return self for chain methods (user, system, functions, advisors, etc.)
-                    return proxy;
-                }
+                (proxy, method, args) -> "call".equals(method.getName())
+                        ? createFakeCallResponseSpec(responsePayload, responseContext)
+                        // Return self for chain methods (user, system, tools, advisors, etc.)
+                        : proxy
         );
     }
 
-    private static Object createFakeCallResponseSpec(Object responsePayload) {
+    private static Object createFakeCallResponseSpec(Object responsePayload, Map<String, Object> responseContext) {
         return Proxy.newProxyInstance(
                 ChatClient.class.getClassLoader(),
                 new Class<?>[]{ChatClient.CallResponseSpec.class},
@@ -105,24 +228,33 @@ class ControllerIntegrationTest {
                     if ("content".equals(method.getName())) {
                         return responsePayload instanceof String ? responsePayload : "";
                     }
-                    if ("entity".equals(method.getName())) {
-                        return responsePayload;
-                    }
                     if ("chatResponse".equals(method.getName())) {
-                        String text;
-                        if (responsePayload instanceof String asString) {
-                            text = asString;
-                        } else {
-                            try {
-                                text = new ObjectMapper().writeValueAsString(responsePayload);
-                            } catch (JsonProcessingException ex) {
-                                throw new IllegalStateException(ex);
-                            }
-                        }
-                        return new ChatResponse(List.of(new Generation(new AssistantMessage(text))));
+                        return toChatResponse(responsePayload);
+                    }
+                    if ("responseEntity".equals(method.getName())) {
+                        return new ResponseEntity<>(toChatResponse(responsePayload), responsePayload);
+                    }
+                    if ("chatClientResponse".equals(method.getName())) {
+                        return new ChatClientResponse(toChatResponse(responsePayload), responseContext);
                     }
                     return null;
                 }
         );
+    }
+
+    // The structured and RAG endpoints read the raw completion as well as the converted result, because a
+    // rejected answer is reported with the text that produced it.
+    private static ChatResponse toChatResponse(Object responsePayload) {
+        String text;
+        if (responsePayload instanceof String asString) {
+            text = asString;
+        } else {
+            try {
+                text = new ObjectMapper().writeValueAsString(responsePayload);
+            } catch (JsonProcessingException ex) {
+                throw new IllegalStateException(ex);
+            }
+        }
+        return new ChatResponse(List.of(new Generation(new AssistantMessage(text))));
     }
 }

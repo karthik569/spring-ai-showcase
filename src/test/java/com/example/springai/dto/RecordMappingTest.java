@@ -60,7 +60,7 @@ class RecordMappingTest {
         RagQueryResponse ragResponse = new RagQueryResponse(
                 "What is the PTO policy?",
                 "25 days annual leave.",
-                List.of("company-policy.md"),
+                List.of(new RetrievedChunk("company-policy.md", 0.61, "25 days annual leave")),
                 120L
         );
 
