@@ -6,9 +6,8 @@ Not project documentation — see `README.md` and `ARCHITECTURE_AND_METHODS.md` 
 **Start here:** Spring Boot **3.5.16** + Spring AI **1.1.8** (GA) on local Ollama (`qwen2.5:0.5b-instruct` chat
 + `all-minilm` embeddings). The upgrade, the new capabilities (RAG upload/filters/scores, persisted memory +
 history, token metrics, demo UI, Swagger, timeouts/health/concurrency) are **done and verified live**, and
-`README.md` / `ARCHITECTURE_AND_METHODS.md` now describe them. **Nothing is committed** — the whole change set
-is sitting in the working tree on `main` because no commit was ever authorised. First action for the next
-session is to review `git status` and ask.
+`README.md` / `ARCHITECTURE_AND_METHODS.md` now describe them. The change set is **committed on `main` as
+`e1b9ade`** and **not pushed** — `origin/main` is one behind. Pushing needs an explicit ask.
 
 ## Environment (this machine)
 
@@ -76,6 +75,11 @@ mvn -B spring-boot:run > run.log 2>&1 &
   H2 file (the shipped script has no `IF NOT EXISTS`; Boot's continue-on-error swallows the duplicate table).
 - **springdoc needs an explicit `consumes`** for `MultipartFile` parts or it documents `application/json` and
   Swagger UI cannot upload. Fixed on `/rag/documents`.
+- **No git identity is configured on this machine.** `git commit` dies with `Author identity unknown`
+  (`unable to auto-detect email address`). Commits need a one-off
+  `git -c user.name="karthik569" -c user.email="sahukarikarteek@gmail.com" commit …` — the identity every
+  existing commit carries. Editing `git config` is off-limits, so the override is per command. No git hooks are
+  active in this repo (only `.sample` files), so a failed commit is never a hook problem.
 - **Windows `curl.exe` cannot read Git Bash `/tmp` paths** — it returns `HTTP 000` with no body. Write scratch
   files under `target/` and use a relative path for `-F file=@…`.
 - **Driving the browser without npm**: Node 22's global `WebSocket` + Edge `--remote-debugging-port=9222` speaks
@@ -138,8 +142,9 @@ moves them.
 
 ## Open work
 
-1. **Nothing is committed.** Review the working tree (`git status`, `git diff`) and ask before committing.
-   `data/` is gitignored; scratch `run*.log` files in the repo root are not tracked and can be removed.
+1. **`e1b9ade` is committed on `main` and not pushed** (`git status -sb` shows `ahead 1`). Push only when asked.
+   `data/` and the root `run*.log` / `ollama.log` / `pull.log` scratch files are gitignored, so they stayed out
+   of the commit — deleting them is safe but unnecessary.
 2. Optional: a small integration test for the upload → filter → answer path, so the filename filter is covered
    without a live embedder (the current tests fake `ChatClient`, so filter-expression correctness is only
    exercised against a real model).
