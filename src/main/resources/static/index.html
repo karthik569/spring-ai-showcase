@@ -361,7 +361,9 @@
         },
         movie: (s) => call(s, '/api/ai/structured/movie?genre=' + encodeURIComponent(value('movieGenre'))),
         rag: (s) => {
-            const body = { question: value('ragQuestion'), topK: 4 };
+            // No topK: /rag/query reads app.rag.top-k, and a field here once promised a per-request override
+            // the endpoint never had.
+            const body = { question: value('ragQuestion') };
             if (value('ragFile')) body.filename = value('ragFile');
             return call(s, '/api/ai/rag/query', {
                 method: 'POST',

@@ -6,7 +6,9 @@ import com.example.springai.controller.StructuredOutputController;
 import com.example.springai.controller.ToolCallingController;
 import com.example.springai.dto.MovieRecommendation;
 import com.example.springai.error.GlobalExceptionHandler;
+import com.example.springai.rag.StubEmbeddingModel;
 import com.example.springai.service.RagDocumentIngestionService;
+import com.example.springai.service.RagStorePersistence;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
@@ -21,7 +23,7 @@ import org.springframework.ai.chat.messages.AssistantMessage;
 import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.ai.chat.model.Generation;
 import org.springframework.ai.document.Document;
-import org.springframework.ai.vectorstore.VectorStore;
+import org.springframework.ai.vectorstore.SimpleVectorStore;
 import org.springframework.http.MediaType;
 import org.springframework.mock.web.MockMultipartFile;
 import org.springframework.test.web.servlet.MockMvc;
@@ -110,14 +112,15 @@ class ControllerIntegrationTest {
                 .build();
         ChatClient fakeChatClient = createFakeChatClient("You get 25 days.", Map.of(
                 QuestionAnswerAdvisor.RETRIEVED_DOCUMENTS, List.of(chunk)));
+        SimpleVectorStore vectorStore = stubbedVectorStore();
 
-        RagController controller = new RagController(createFakeBuilder(fakeChatClient), unusedVectorStore(),
-                new RagDocumentIngestionService(unusedVectorStore()), 4, 0.2);
+        RagController controller = new RagController(createFakeBuilder(fakeChatClient), vectorStore,
+                ingestionService(vectorStore), 4, 0.2);
         MockMvc mockMvc = MockMvcBuilders.standaloneSetup(controller).build();
 
         mockMvc.perform(post("/api/ai/rag/query")
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"question\":\"How many leave days?\",\"topK\":2}"))
+                        .content("{\"question\":\"How many leave days?\"}"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.answer").value("You get 25 days."))
                 .andExpect(jsonPath("$.sourceDocuments[0].filename").value("policy.md"))
@@ -126,8 +129,9 @@ class ControllerIntegrationTest {
 
     @Test
     void testRagQueryRejectsABlankQuestion() throws Exception {
+        SimpleVectorStore vectorStore = stubbedVectorStore();
         RagController controller = new RagController(createFakeBuilder(createFakeChatClient("x", Map.of())),
-                unusedVectorStore(), new RagDocumentIngestionService(unusedVectorStore()), 4, 0.2);
+                vectorStore, ingestionService(vectorStore), 4, 0.2);
         MockMvc mockMvc = MockMvcBuilders.standaloneSetup(controller)
                 .setControllerAdvice(new GlobalExceptionHandler())
                 .build();
@@ -142,8 +146,9 @@ class ControllerIntegrationTest {
 
     @Test
     void testRagUploadRejectsAFileNameThatCouldBreakAFilterExpression() throws Exception {
+        SimpleVectorStore vectorStore = stubbedVectorStore();
         RagController controller = new RagController(createFakeBuilder(createFakeChatClient("x", Map.of())),
-                unusedVectorStore(), new RagDocumentIngestionService(unusedVectorStore()), 4, 0.2);
+                vectorStore, ingestionService(vectorStore), 4, 0.2);
         MockMvc mockMvc = MockMvcBuilders.standaloneSetup(controller)
                 .setControllerAdvice(new GlobalExceptionHandler())
                 .build();
@@ -158,8 +163,9 @@ class ControllerIntegrationTest {
 
     @Test
     void testRagUploadIndexesAPlaintextDocument() throws Exception {
+        SimpleVectorStore vectorStore = stubbedVectorStore();
         RagController controller = new RagController(createFakeBuilder(createFakeChatClient("x", Map.of())),
-                unusedVectorStore(), new RagDocumentIngestionService(unusedVectorStore()), 4, 0.2);
+                vectorStore, ingestionService(vectorStore), 4, 0.2);
         MockMvc mockMvc = MockMvcBuilders.standaloneSetup(controller).build();
 
         MockMultipartFile document = new MockMultipartFile("file", "runbook.md", "text/markdown",
@@ -201,12 +207,16 @@ class ControllerIntegrationTest {
         );
     }
 
-    private static VectorStore unusedVectorStore() {
-        return (VectorStore) Proxy.newProxyInstance(
-                VectorStore.class.getClassLoader(),
-                new Class<?>[]{VectorStore.class},
-                (proxy, method, args) -> null
-        );
+    // A real store over the offline stub embedder: uploads are indexed for real, so this exercises the
+    // splitter and the store rather than a mock of them. Persistence is off, because writing a snapshot from
+    // a controller test would assert SimpleVectorStore's file format twice.
+    private static SimpleVectorStore stubbedVectorStore() {
+        return SimpleVectorStore.builder(new StubEmbeddingModel()).build();
+    }
+
+    private static RagDocumentIngestionService ingestionService(SimpleVectorStore vectorStore) {
+        return new RagDocumentIngestionService(vectorStore,
+                new RagStorePersistence(vectorStore, false, "target/rag-store-never-written", false));
     }
 
     private static Object createFakeRequestSpec(Object responsePayload, Map<String, Object> responseContext) {

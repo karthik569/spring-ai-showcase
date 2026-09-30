@@ -1,0 +1,137 @@
+[
+  {
+    "id": "stipend-amount",
+    "question": "How much home office equipment stipend do employees get?",
+    "filename": "company-policy.md",
+    "marker": "$1,500 annual home office equipment stipend",
+    "topK": 3,
+    "maxFirstHitRank": 1,
+    "expect": "match"
+  },
+  {
+    "id": "equipment-examples",
+    "question": "What kind of equipment does the stipend cover?",
+    "filename": "company-policy.md",
+    "marker": "noise-cancelling headphones",
+    "topK": 3,
+    "maxFirstHitRank": 1,
+    "expect": "match"
+  },
+  {
+    "id": "reimbursement-window",
+    "question": "How long do I have to submit an equipment reimbursement?",
+    "filename": "company-policy.md",
+    "marker": "within 30 days of purchase",
+    "topK": 3,
+    "maxFirstHitRank": 1,
+    "expect": "match"
+  },
+  {
+    "id": "learning-activities",
+    "question": "What can I spend the conference budget on?",
+    "filename": "company-policy.md",
+    "marker": "attending technical conferences",
+    "topK": 3,
+    "maxFirstHitRank": 1,
+    "expect": "match"
+  },
+  {
+    "id": "learning-budget-amount",
+    "question": "How much is the annual learning budget?",
+    "filename": "company-policy.md",
+    "marker": "$2,500 annual budget",
+    "topK": 3,
+    "maxFirstHitRank": 1,
+    "expect": "match"
+  },
+  {
+    "id": "annual-leave-days",
+    "question": "How many days of annual leave do I get?",
+    "filename": "company-policy.md",
+    "marker": "25 days of annual leave",
+    "topK": 3,
+    "maxFirstHitRank": 1,
+    "expect": "match"
+  },
+  {
+    "id": "parental-leave-length",
+    "question": "How long is parental leave?",
+    "filename": "company-policy.md",
+    "marker": "16 weeks of fully paid leave",
+    "topK": 3,
+    "maxFirstHitRank": 1,
+    "expect": "match"
+  },
+  {
+    "id": "wellness-days-count",
+    "question": "How many company wellness days are there each year?",
+    "filename": "company-policy.md",
+    "marker": "4 designated company-wide wellness days",
+    "topK": 3,
+    "maxFirstHitRank": 1,
+    "expect": "match"
+  },
+  {
+    "id": "ai-tooling-allowed",
+    "question": "Which AI tools are we allowed to use on company code?",
+    "filename": "company-policy.md",
+    "marker": "approved AI coding assistants",
+    "topK": 3,
+    "maxFirstHitRank": 1,
+    "expect": "match"
+  },
+  {
+    "id": "pii-prohibition",
+    "question": "What must never be pasted into a third-party LLM interface?",
+    "filename": "company-policy.md",
+    "marker": "Sensitive customer PII",
+    "topK": 3,
+    "maxFirstHitRank": 1,
+    "expect": "match"
+  },
+  {
+    "id": "acronym-pii",
+    "question": "What is PII?",
+    "filename": "company-policy.md",
+    "marker": "Personally Identifiable Information",
+    "topK": 3,
+    "maxFirstHitRank": 1,
+    "expect": "match"
+  },
+  {
+    "id": "acronym-pto",
+    "question": "pto",
+    "filename": "company-policy.md",
+    "marker": "25 days of annual leave",
+    "topK": 3,
+    "maxFirstHitRank": 1,
+    "expect": "match"
+  },
+  {
+    "id": "failover-from-runbook",
+    "question": "when is failover allowed?",
+    "filename": "ops-runbook.md",
+    "marker": "02:00-04:00 UTC only",
+    "topK": 3,
+    "maxFirstHitRank": 1,
+    "expect": "match"
+  },
+  {
+    "id": "failover-outside-corpus",
+    "question": "when is database failover approved?",
+    "filename": "company-policy.md",
+    "marker": "02:00-04:00",
+    "topK": 3,
+    "maxFirstHitRank": 0,
+    "expect": "nomatch"
+  },
+  {
+    "id": "espresso-outside-corpus",
+    "question": "what is the espresso machine budget?",
+    "filename": "company-policy.md",
+    "marker": "espresso",
+    "topK": 3,
+    "maxFirstHitRank": 0,
+    "expect": "nomatch"
+  }
+]

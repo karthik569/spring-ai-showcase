@@ -66,6 +66,25 @@ mvn -B spring-boot:run > run.log 2>&1 &
    `Retry-After` on the retryable 503s, and `GlobalExceptionHandler` extended to validation/upload/404-shaped
    failures.
 
+## What changed later on 2026-09-30 (the RAG round)
+
+1. **The knowledge base survives a restart.** `RagStorePersistence` snapshots `SimpleVectorStore` to
+   `./data/rag/vector-store.json` and keeps `{"version":1,"checksums":{filename:sha256}}` in
+   `rag-store.json`; boot is restore → checksum-keyed refresh → one save, so `POST /rag/documents` work is no
+   longer lost and an unchanged shipped document is not re-embedded. A truncated snapshot is caught by an
+   integrity probe and re-indexed **loudly** instead of leaving an empty store that logs success.
+2. **Retrieval is regression-testable offline.** `src/test/java/…/rag/` holds `StubEmbeddingModel`,
+   `RetrievalMetrics`, `GoldenQuestions` (shared by both tiers), `GoldenQuestionsTest` and
+   `LiveRetrievalComparisonTest`, with 15 rows in `src/test/resources/rag/golden-questions.json` and a test-only
+   runbook under `src/test/resources/rag/corpus/`. Tier 1 runs in `mvn -B test` with the model off; tier 2 is
+   `-Dapp.rag.eval=true` and *reports* rather than asserts.
+3. **`RagQueryRequest.topK` is gone** (see §Traps) along with `index.html` sending it and the README claiming it
+   worked.
+4. **Not built:** hybrid retrieval (BM25 + RRF) and the grounding gate. Both are designed in the approved plan,
+   and §Open work item 6 records the two measurements that undercut their premises — read it before starting.
+5. **Still deliberately untouched:** `pom.xml` (so tier 2 is opted in by system property, not excluded by a
+   surefire tag), `src/main/resources/docs/` (one shipped fixture), and any real vector store.
+
 ## Traps that cost the most time
 
 - **An advisor at `Ordered.LOWEST_PRECEDENCE` never runs.** Spring AI appends its terminal advisor
@@ -87,14 +106,39 @@ mvn -B spring-boot:run > run.log 2>&1 &
 - **Local embedding scores drift between runs.** The identical query/document pair read `0.1176` and then
   `0.1228` on two calls to `/rag/search`. Ollama's embedder is not bit-stable, so never write a test or a doc
   that asserts a third decimal.
+- **Both `./data/rag` files are needed to restore, and the pair is not portable.** `vector-store.json` is
+  Spring AI's format and `rag-store.json` is the manifest; one without the other is a cold start by design, and
+  `restore()` never throws. Deleting the directory is the reset button. The three knobs are
+  `app.rag.store.{enabled,directory,save-on-write}`, each with an env form
+  (`RAG_STORE_ENABLED`, `RAG_STORE_DIRECTORY`, `RAG_STORE_SAVE_ON_WRITE`) or a
+  `--app.rag.store.directory=…` argument. Tier 2 needs `-Dapp.rag.eval=true` to reach the **forked** test JVM —
+  surefire propagates system properties, so the plain flag works (verified); `-DargLine=-Dapp.rag.eval=true` is
+  the fallback if a class reports skipped when you expected it to run. Tier 2 also needs the **same `OPENAI_*`
+  env as the app** — reproduced: with `OPENAI_BASE_URL` unset, boot aimed at the default `localhost:8081`,
+  ingestion logged `Document ingestion deferred or offline`, and the run reported `Skipped: 1` while looking
+  exactly like an unmet `-D` flag.
+- **A filename collision is now permanent.** Uploading `company-policy.md` evicts the shipped chunks, and after a
+  restart persistence restores the upload, the checksum no longer matches the manifest, and boot re-indexes 3
+  chunks over the top — the uploaded text is gone (verified: 3 → 1 → restart → 3). Before persistence this was
+  also true, but the next boot silently repaired it.
+- **`POST /rag/query` no longer accepts `topK`.** The field was validated, sent by `index.html`, documented in
+  the README — and never read by the controller. Chunk count is `app.rag.top-k` only. An old client posting
+  `{"question":…, "topK":2}` still gets 200 (unknown fields are ignored), so nothing tells you the parameter is
+  inert; check `/v3/api-docs` (schema `[question, filename]`) rather than a status code.
 - **Try a config change without editing tracked YAML:**
   `mvn -B spring-boot:run -Dspring-boot.run.arguments=--app.rag.similarity-threshold=0.4`. Verified: the `pto`
   query goes from one citation (≈0.32) to zero at 0.4 — a clean demo of a threshold silently un-grounding an
   answer, and the basis of `docs/GETTING_STARTED.md` §Step 3.
 - **Both the app and Ollama can die silently** between sessions (the CLI background task does not outlive the
   session, and `ollama.exe` was gone too). Symptoms: `curl` → `HTTP 000` / exit 7 on 8080 or 11434. Restart
-  `ollama serve` first, then the app — an app that booted without a backend has an **empty vector store** and
-  must be restarted to re-ingest `classpath:/docs/*.md`.
+  `ollama serve` first, then the app. Since persistence landed, a backend that was down at boot is much less
+  damaging: `SimpleVectorStore.load` is pure JSON and the integrity probe swallows the embedder's absence, so
+  `./data/rag` still restores into RAM and the uploaded documents are not lost by a boot that happened without a
+  model. Queries still embed their input, so nothing answers until the embedder is up — what changed is that the
+  knowledge base survives the outage instead of being re-embedded or emptied. What still needs a restart is a
+  **first** run with no snapshot at all: the store is empty, boot logs
+  `Document ingestion deferred or offline`, and `/rag/query` answers fluently from the model's own memory until
+  you start the app again with the embedder up.
 - **A second app instance does not fail on the port — it fails on the H2 file lock**, and the message is
   misleading. Reproduced: `Failed to determine DatabaseDriver` → `CannotGetJdbcConnectionException` →
   `The file is locked: …/data/chat-memory.mv.db`. It reads like a datasource misconfiguration; it only means an
@@ -124,8 +168,12 @@ mvn -B spring-boot:run > run.log 2>&1 &
   Four UI bugs were found only by driving it (citations never rendering, empty raw dump for payloads without an
   `answer` field, stale citations after a failed follow-up, duplicated JSON block) — all fixed in
   `src/main/resources/static/index.html`.
-- `mvn -B test` → **19 tests, 0 failures** across 5 classes (up from 12; `AiConcurrencyLimitFilterTest`,
-  `RecordMappingTest` and the RAG upload cases in `ControllerIntegrationTest` are new).
+- `mvn -B test` → **32 tests, 31 run and 1 skipped, 0 failures** across 9 classes. The skip is
+  `LiveRetrievalComparisonTest`, which is gated on `-Dapp.rag.eval=true` rather than a tag, because a tag needs
+  surefire config and the build file is off-limits this round. New since the RAG round:
+  `RagStorePersistenceTest` (9), `GoldenQuestionsTest` (2), `StubEmbeddingModel` / `RetrievalMetrics` /
+  `GoldenQuestions` / `OllamaReachable` (helpers, not tests), plus `LiveRetrievalComparisonTest` (1, opt-in).
+  Verified green with **Ollama switched off** — that is the point of the stub embedder tier.
 - Both 413 paths verified live: a 600 KB file → `{"error":"request_rejected","status":413,"detail":"document is
   larger than 512 KB"}`, a 1.1 MB file → `document_too_large` from `MaxUploadSizeExceededException`.
 
@@ -152,8 +200,10 @@ you document any sample output:
 - **No canned-response fallback.** "Graceful degradation" here means `503` + `Retry-After` + a DOWN `llm`
   health component, not a static sentence returned as if the model answered. Returning invented text would
   defeat the point of a showcase whose error bodies carry a `requestId`.
-- **No `SimpleVectorStore` persistence.** Persisting uploads means either a hand-rolled save/load or a real
-  vector DB; the in-memory store re-ingests from `classpath:/docs/*.md` at boot and says so in the README.
+- **No real vector database.** Persistence landed as `SimpleVectorStore.save`/`load` over two files in
+  `./data/rag` plus a per-filename SHA-256 manifest, precisely so the showcase stays zero-infrastructure. What it
+  is *not*: a searchable-on-disk store (the RAM copy is authoritative at serve time), and not migration-safe —
+  `vector-store.json` is Spring AI's format, owned by them. pgvector is the next step if the store outgrows RAM.
 - **No forced `tool_choice`.** The M4-era claim in the old notes was unverifiable and was deleted; the endpoint
   keeps the empirical temperature note instead.
 - **No rerank / query-rewriting advisors.** On a 494M model these add latency and damage recall rather than
@@ -191,13 +241,30 @@ moves them.
 3. **No Maven wrapper** (`mvnw`, `mvnw.cmd`, `.mvn/` are absent, though `.gitignore` already has a
    `maven-wrapper.jar` exception). `mvn` must be installed globally. `mvn wrapper:wrapper` would add it — that
    touches the build, so it needs an explicit ask.
-4. Optional: a small integration test for the upload → filter → answer path, so the filename filter is covered
-   without a live embedder (the current tests fake `ChatClient`, so filter-expression correctness is only
-   exercised against a real model).
+4. **Partly closed by the eval harness, still open at the advisor level.** `GoldenQuestionsTest` exercises real
+   filter expressions and real thresholds against a real `SimpleVectorStore`, so `filename` filtering and the
+   floor now have offline coverage. What it does not cover is `QuestionAnswerAdvisor`'s own
+   `FILTER_EXPRESSION` plumbing — that path is still only seen by a live model call.
 5. Optional: `src/main/resources/docs/` holds one policy file; a second fixture would make filtered-RAG
-   examples clearer without asking users to upload first.
-6. Consider a local model upgrade if factual answers matter more than staying offline.
-7. `ARCHITECTURE_AND_METHODS.md`, `README.md` and `docs/GETTING_STARTED.md` were rewritten against 1.1.8 on
+   examples clearer without asking users to upload first. **Deliberately still open:** the eval's second document
+   lives at `src/test/resources/rag/corpus/ops-runbook.md` instead, because shipping a second file would
+   invalidate every quoted `Indexed 3 chunks` line and every score sample in `README.md` §6 and
+   `docs/GETTING_STARTED.md` — those numbers were measured, not invented, and re-measuring them is a separate
+   pass.
+6. **The C/D design in the approved plan rests on two premises that measurement contradicted** — re-read before
+   building. (a) *Hybrid retrieval is justified by acronym recall on the vector leg*: with live `all-minilm`, all
+   13 `match` rows — `pto` and `PII` included — came back at **rank 1** (MRR 1.000, same as the stub tier). The
+   rank evidence on this corpus says BM25 would be a second way to be right, not a fix. Re-measure unfiltered, on
+   a bigger corpus, before writing `Bm25Scorer`. (b) *A grounding gate can be a score comparison*: the `nomatch`
+   query "what is the espresso machine budget" scored **0.405** against `company-policy.md` (0.407 on the earlier
+   run) — higher than three genuine matches (0.345 / 0.299 / 0.158). A cosine floor cannot separate answerable
+   from unanswerable, so D's gate has to be a count/coverage test, or it will refuse questions the model could
+   answer. (c) A third measurement, and the one that changes D's shape: `acronym-pii` retrieves its gold chunk at
+   **rank 1 with cosine 0.158**, i.e. under `app.rag.similarity-threshold: 0.2`. Correct retrieval plus a correct
+   drop. A gate that only looks at "did something clear the floor" cannot distinguish that from a genuine miss,
+   so the refusal has to quote the rank-1 candidate's score whether or not it passed.
+8. Consider a local model upgrade if factual answers matter more than staying offline.
+9. `ARCHITECTURE_AND_METHODS.md`, `README.md` and `docs/GETTING_STARTED.md` were rewritten against 1.1.8 on
    2026-09-30 — every quoted sample in them was produced by running the command in this repo's shell that day,
    so the scores carry the drift noted in §Traps. If the version moves again, the rows in
    `ARCHITECTURE_AND_METHODS.md` §8 (migration table) and the step outputs in `GETTING_STARTED.md` are the

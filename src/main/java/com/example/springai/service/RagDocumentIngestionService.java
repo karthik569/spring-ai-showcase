@@ -12,6 +12,7 @@ import org.springframework.core.io.Resource;
 import org.springframework.core.io.support.PathMatchingResourcePatternResolver;
 import org.springframework.stereotype.Service;
 
+import java.io.IOException;
 import java.time.Instant;
 import java.util.List;
 
@@ -21,21 +22,40 @@ public class RagDocumentIngestionService implements CommandLineRunner {
     private static final Logger log = LoggerFactory.getLogger(RagDocumentIngestionService.class);
 
     private final VectorStore vectorStore;
+    private final RagStorePersistence persistence;
 
-    public RagDocumentIngestionService(VectorStore vectorStore) {
+    public RagDocumentIngestionService(VectorStore vectorStore, RagStorePersistence persistence) {
         this.vectorStore = vectorStore;
+        this.persistence = persistence;
     }
 
     @Override
     public void run(String... args) {
         try {
-            log.info("[RAG-INGESTION] Scanning for knowledge base documents in classpath:/docs/*.md...");
-            PathMatchingResourcePatternResolver resolver = new PathMatchingResourcePatternResolver();
-            Resource[] resources = resolver.getResources("classpath:/docs/*.md");
+            // Restore first: uploads live only in the store, so a run that skips this step loses them.
+            boolean restored = persistence.restore();
+            persistence.beginBatch();
+            try {
+                log.info("[RAG-INGESTION] Scanning for knowledge base documents in classpath:/docs/*.md...");
+                PathMatchingResourcePatternResolver resolver = new PathMatchingResourcePatternResolver();
+                Resource[] resources = resolver.getResources("classpath:/docs/*.md");
 
-            for (Resource resource : resources) {
-                int chunks = ingest(resource, resource.getFilename(), "classpath");
-                log.info("[RAG-INGESTION] Indexed {} chunks from {}", chunks, resource.getFilename());
+                for (Resource resource : resources) {
+                    String filename = resource.getFilename();
+                    String checksum = digestOf(resource);
+                    if (restored && checksum != null
+                            && checksum.equals(persistence.checksumOf(filename).orElse(null))) {
+                        log.info("[RAG-INGESTION] Kept persisted chunks for {} (unchanged)", filename);
+                        continue;
+                    }
+                    // Unconditional rather than only on the restored path: a snapshot the probe rejected can
+                    // still hold half of a document's chunks, and deleting from an empty store costs nothing.
+                    evict(filename);
+                    int chunks = ingest(resource, filename, "classpath");
+                    log.info("[RAG-INGESTION] Indexed {} chunks from {}", chunks, filename);
+                }
+            } finally {
+                persistence.endBatch();
             }
         } catch (Exception ex) {
             log.warn("[RAG-INGESTION] Document ingestion deferred or offline: {}", ex.getMessage());
@@ -49,6 +69,8 @@ public class RagDocumentIngestionService implements CommandLineRunner {
      * @return the number of chunks written
      */
     public int ingest(Resource resource, String filename, String origin) {
+        // Digest before the reader consumes the stream, so the recorded bytes match what was indexed.
+        String checksum = digestOf(resource);
         TextReader textReader = new TextReader(resource);
         textReader.getCustomMetadata().put("filename", filename);
         textReader.getCustomMetadata().put("origin", origin);
@@ -70,6 +92,7 @@ public class RagDocumentIngestionService implements CommandLineRunner {
             return 0;
         }
         vectorStore.add(chunks);
+        persistence.remember(filename, checksum);
         return chunks.size();
     }
 
@@ -78,5 +101,16 @@ public class RagDocumentIngestionService implements CommandLineRunner {
         vectorStore.delete(new FilterExpressionBuilder()
                 .eq("filename", filename)
                 .build());
+        persistence.forget(filename);
+    }
+
+    /** A resource that cannot be read records no checksum, which means the next boot indexes it again. */
+    private static String digestOf(Resource resource) {
+        try {
+            return RagStorePersistence.sha256(resource);
+        } catch (IOException ex) {
+            log.warn("[RAG-INGESTION] Could not read {} for a checksum: {}", resource, ex.getMessage());
+            return null;
+        }
     }
 }

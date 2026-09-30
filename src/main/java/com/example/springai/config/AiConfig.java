@@ -9,7 +9,6 @@ import org.springframework.ai.chat.memory.ChatMemoryRepository;
 import org.springframework.ai.chat.memory.MessageWindowChatMemory;
 import org.springframework.ai.embedding.EmbeddingModel;
 import org.springframework.ai.vectorstore.SimpleVectorStore;
-import org.springframework.ai.vectorstore.VectorStore;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -62,8 +61,12 @@ public class AiConfig {
                 .build();
     }
 
+    /**
+     * The subtype is exposed, not {@code VectorStore}, because persistence lives on it: RagStorePersistence
+     * calls save/load, and every injection point still asks for the interface.
+     */
     @Bean
-    public VectorStore vectorStore(EmbeddingModel embeddingModel) {
+    public SimpleVectorStore vectorStore(EmbeddingModel embeddingModel) {
         return SimpleVectorStore.builder(embeddingModel).build();
     }
 }

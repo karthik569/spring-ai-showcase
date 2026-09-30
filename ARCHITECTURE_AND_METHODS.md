@@ -76,7 +76,7 @@ chunk carries **no** usage counters, which is why the advisor skips zero totals 
 | `tokenUsageAdvisorCustomizer()` | `ChatClientCustomizer` adding `TokenUsageAdvisor` to every builder. | Controllers build clients in their constructors (RAG needs a store-specific advisor); a customizer means each one does not re-declare token accounting. |
 | `chatClient(ChatClient.Builder)` | Stateless client with the shared system prompt. | Tools, structured output and vision have no conversation. Since Spring AI **1.1.6** `MessageChatMemoryAdvisor` *rejects* a call with no conversation id, so a memory-carrying client could not serve them even if it were desirable. |
 | `conversationalChatClient(ChatClient.Builder, ChatMemory)` | `@Qualifier("conversationalChatClient")`; adds `MessageChatMemoryAdvisor`. | Serves `/chat/memory`, `/chat/stream`. Every call must supply `ChatMemory.CONVERSATION_ID` — that parameter is what keeps two callers' histories apart. |
-| `vectorStore(EmbeddingModel)` | `SimpleVectorStore` — in-memory, cosine, `all-minilm` vectors. | Zero-infrastructure RAG. It is **not** persisted: content is re-ingested from `classpath:/docs/*.md` at boot, and anything uploaded through `POST /rag/documents` is lost on restart (deliberate; the alternative is a real vector database). |
+| `vectorStore(EmbeddingModel)` | `SimpleVectorStore` — in-memory, cosine, `all-minilm` vectors. | Zero-infrastructure RAG. Returns the **subtype**, not `VectorStore`, because persistence lives on it (`save`/`load`); every injection point still asks for the interface. Snapshotted to `./data/rag` by `RagStorePersistence`, so uploads survive a restart. The alternative is still a real vector database, which this showcase deliberately does not pull in. |
 
 ### [`EndpointLoggingFilter.java`](src/main/java/com/example/springai/config/EndpointLoggingFilter.java)
 
@@ -132,7 +132,7 @@ opaque 500.
 
 | Method | Route | Notes |
 | :--- | :--- | :--- |
-| `queryKnowledgeBase` | `POST /api/ai/rag/query` | `QuestionAnswerAdvisor` retrieves, the model answers, and citations come from `response.context().get(RETRIEVED_DOCUMENTS)` — literally the chunks that reached the prompt. `filename` maps to the advisor's `FILTER_EXPRESSION` parameter. |
+| `queryKnowledgeBase` | `POST /api/ai/rag/query` | `QuestionAnswerAdvisor` retrieves, the model answers, and citations come from `response.context().get(RETRIEVED_DOCUMENTS)` — literally the chunks that reached the prompt. `filename` maps to the advisor's `FILTER_EXPRESSION` parameter. `RagQueryRequest` is `{question, filename}` only: how many chunks get injected is `app.rag.top-k`, a deployment setting, and the per-request `topK` field that used to sit here was validated, documented and never read. |
 | `rawVectorSearch` | `GET /api/ai/rag/search` | `similarityThresholdAll()` plus an optional `FilterExpressionBuilder().eq("filename", …)`. Surfaces `Document.getScore()`. When nothing matches it returns `totalResults: 0` **and** a `note`, because an inspection endpoint that returns a bare empty list cannot be told apart from an empty store. |
 | `addDocument` | `POST /api/ai/rag/documents` | `multipart/form-data`, ≤512 KB per file, `evict(filename)` before `ingest(...)` so re-uploading replaces instead of duplicating. |
 
@@ -198,15 +198,61 @@ status and cause.
 
 ### [`RagDocumentIngestionService.java`](src/main/java/com/example/springai/service/RagDocumentIngestionService.java)
 
-- `run(String...)` — `CommandLineRunner` that ingests every `classpath:/docs/*.md`. Wrapped in try/catch so a
-  missing or dead embedding backend **cannot block startup**; it logs
-  `Document ingestion deferred or offline`. This is why `/actuator/health` reports UP without a model.
+- `run(String...)` — `CommandLineRunner` that restores the snapshot, then refreshes every
+  `classpath:/docs/*.md`. Wrapped in try/catch so a missing or dead embedding backend **cannot block
+  startup**; it logs `Document ingestion deferred or offline`. This is why `/actuator/health` reports UP
+  without a model.
+  ```java
+  boolean restored = persistence.restore();
+  persistence.beginBatch();                       // one save after the loop, not one per document
+  for (Resource resource : resolver.getResources("classpath:/docs/*.md")) {
+      if (restored && checksum != null && checksum.equals(persistence.checksumOf(filename).orElse(null))) { … continue; }
+      evict(filename);                            // unconditional; see the note below
+      ingest(resource, filename, "classpath");
+  }
+  // finally: persistence.endBatch();
+  ```
+  The `evict` is unconditional rather than only on the restored path, because a snapshot the integrity probe
+  rejected can still hold half a document's chunks — re-ingesting on top of those would double-index them, and
+  deleting from an empty store costs nothing. The loop keys on **checksum, not filename**: unchanged bytes are
+  logged as `Kept persisted chunks for company-policy.md (unchanged)` and never re-embedded, changed bytes
+  replace only that document. Chunks with `origin=upload` are outside this loop entirely.
 - `ingest(Resource, filename, origin)` — `TextReader` → metadata (`filename`, `origin`, `ingestedAt`) →
-  `TokenTextSplitter` (chunk 120 tokens, min 50 chars, keep separator, max 200 chunks) → `vectorStore.add`.
-  Chunk size is the whole game for a 494M model: at the original 400-token setting the entire policy file was
-  **one** vector, so every question matched the same chunk and answers came from whichever section the model
-  read first. `origin` distinguishes `classpath` from `upload` when filtering.
-- `evict(filename)` — `vectorStore.delete(FilterExpression.eq("filename", …))`, used before a re-upload.
+  `TokenTextSplitter` (chunk 120 tokens, min 50 chars, keep separator, max 200 chunks) → `vectorStore.add` →
+  `persistence.remember(filename, sha256)`. The digest is taken **before** `TextReader` consumes the stream, so
+  the recorded bytes are the bytes that were indexed; an empty split returns 0 without recording. Chunk size is
+  the whole game for a 494M model: at the original 400-token setting the entire policy file was **one** vector,
+  so every question matched the same chunk and answers came from whichever section the model read first.
+  `origin` distinguishes `classpath` from `upload` when filtering.
+- `evict(filename)` — `vectorStore.delete(FilterExpression.eq("filename", …))` plus `persistence.forget`, used
+  before a re-upload and by the boot refresh.
+
+### [`RagStorePersistence.java`](src/main/java/com/example/springai/service/RagStorePersistence.java)
+
+Two files, one owner each: `data/rag/vector-store.json` is `SimpleVectorStore.save()`'s own serialization and is
+opaque to this class; `data/rag/rag-store.json` is ours — `{"version":1,"checksums":{filename:sha256}}`. A
+restore needs **both**; either missing or unreadable is a cold start (the pre-persistence behaviour) plus a
+log line, never an exception. Every method is `synchronized`, and neither `restore()` nor `persist()` throws.
+
+| Method | Behaviour |
+| :--- | :--- |
+| `restore()` | Reads the manifest, `vectorStore.load(file)`, runs the integrity probe, returns true only when the store genuinely holds what the manifest claims. |
+| `persist()` | `Files.createDirectories` first (`save(File)` uses `Files.createFile` and needs the parent), then both files. No-op while not `dirty`. |
+| `checksumOf` / `remember` / `forget` | The manifest. `remember`/`forget` mark it dirty, so `save-on-write` controls whether each upload hits the disk immediately. |
+| `beginBatch` / `endBatch` | Depth counter suppressing per-write saves during boot; `endBatch` persists at depth 0. |
+| `persistOnShutdown()` | `@PreDestroy`, so a dirty buffer is not lost when the process is stopped cleanly. |
+| `sha256(Resource)` | Static, streams through `MessageDigest`, works from the exploded classpath **and** from inside a jar. |
+
+**Why a checksum manifest at all:** `VectorStore` exposes no scan or count. "Is this document already indexed?"
+could otherwise only be answered by an embedding-backed probe query — i.e. it would need Ollama running at boot,
+which is exactly the coupling the try/catch above exists to avoid.
+
+**The integrity probe.** A truncated `vector-store.json` can still parse into an *empty* store. Without a check,
+the boot log would claim the chunks were kept while the knowledge base holds nothing. So when the manifest is
+non-empty, one `similaritySearch(query "policy", topK 1, similarityThresholdAll())` decides: 0 hits ⇒
+`Discarding stale or partial vector snapshot …` (WARN) and a full re-index. The probe needs the embedder, so if
+it raises instead of returning, the snapshot is **kept** with a debug line — re-indexing would fail for the same
+reason and only leave the store emptier.
 
 ### [`OrderToolService.java`](src/main/java/com/example/springai/service/OrderToolService.java) / [`WeatherToolService.java`](src/main/java/com/example/springai/service/WeatherToolService.java)
 
@@ -264,7 +310,21 @@ Boot's continue-on-error behaviour means the shipped script — which has no `IF
 duplicate-table error ignored, so a second boot keeps its rows instead of failing. Verified across three
 restarts.
 
-`SimpleVectorStore` is in RAM by design and re-ingests from the classpath at boot.
+Vector store: two JSON files under `./data/rag` (gitignored; `RAG_STORE_DIRECTORY` overrides, and
+`RAG_STORE_ENABLED=false` reverts to the pre-persistence behaviour of an ephemeral in-RAM store re-ingested from
+the classpath at every boot). `SimpleVectorStore` is still in RAM at serve time — the snapshot exists so that
+documents uploaded through `POST /rag/documents` survive a restart, which re-embedding the classpath never did.
+Same chunk id before and after, so `evict(filename)` semantics are unchanged by persistence. See §5 for the
+manifest, the checksum-keyed refresh and the integrity probe; `README.md` §6 for the three env knobs.
+
+A filename collision is the one destructive edge, and persistence makes it permanent rather than self-healing:
+upload a file named `company-policy.md` and the shipped document's chunks are evicted (3 → 1). On the next boot
+the snapshot restores the uploaded chunk, the refresh loop finds the shipped bytes differ from the manifest entry
+it no longer has, and re-indexes 3 chunks under that filename — the uploaded text is gone. Verified: 3 chunks →
+upload → 1 chunk → restart → 3 chunks.
+
+`SimpleVectorStore.save()` logs `Overwriting existing vector store file` on every write, so a chatty
+`RAG_STORE_SAVE_ON_WRITE=false` plus the `@PreDestroy` flush is the quiet alternative.
 
 ---
 
@@ -287,14 +347,51 @@ restarts.
 ## 9. How to test
 
 ```bash
-mvn -B test
+mvn -B test                              # 32 tests: 31 run offline, 1 skipped
+mvn -B test -Dapp.rag.eval=true          # + the live tier-2 retrieval table
 ```
 
-19 tests, no Spring context and no model calls: `ControllerIntegrationTest` builds MockMvc standalone and
-fakes `ChatClient` with `java.lang.reflect.Proxy` (`entity()`/`responseEntity()` return the payload,
-`content()` returns `""` unless the payload is a `String`, every other chain method returns self). Keep
-`.responseEntity(...)`/`.entity(...)` in the controllers — rewriting them to `.content()` plus a manual
-converter breaks `testStructuredOutputControllerStandalone`. `AiConcurrencyLimitFilterTest` drives the filter
+Three tiers, separated by what they need to be up — not by a tag, because a tag would need surefire
+configuration and the build file is deliberately untouched.
+
+**Tier 0 — endpoints, no model.** `ControllerIntegrationTest` builds MockMvc standalone and fakes `ChatClient`
+with `java.lang.reflect.Proxy`
+(`entity()`/`responseEntity()` return the payload, `content()` returns `""` unless the payload is a `String`,
+every other chain method returns self). Keep `.responseEntity(...)`/`.entity(...)` in the controllers —
+rewriting them to `.content()` plus a manual converter breaks `testStructuredOutputControllerStandalone`. Its
+vector store is no longer a null-returning proxy: `RagStorePersistence`'s constructor needs the `SimpleVectorStore`
+subtype, so those tests now inject a real store over `StubEmbeddingModel` with persistence pointed at a directory
+nothing writes to. Strictly better coverage for the same speed. `AiConcurrencyLimitFilterTest` drives the filter
 with a holder thread that keeps the only permit, asserting the second call gets 503 + `Retry-After` and never
-reaches the chain. Live behaviour (grounded RAG answers, token log lines, tool execution, SSE incremental
-delivery, health DOWN with no backend) has to be exercised against a real model — see `README.md`.
+reaches the chain.
+
+**Tier 1 — retrieval quality, offline and deterministic.** `GoldenQuestionsTest` ingests
+`src/main/resources/docs/company-policy.md` plus a test-only `src/test/resources/rag/corpus/ops-runbook.md` into
+a **real** `SimpleVectorStore` over `StubEmbeddingModel`, then measures 15 rows from
+`src/test/resources/rag/golden-questions.json` against `src/test/java/…/rag/RetrievalMetrics.java`. Stubbing only
+the embedder is the whole trick: `TokenTextSplitter`, the cosine math, the filter evaluator and the ranking all
+run for real, so a regression in any of them is caught with Ollama switched off. Two properties make the gate
+drift-proof: the harness always searches with `similarityThresholdAll()` (so
+`app.rag.similarity-threshold` cannot move a metric), and pass/fail is on **rank**, never score value —
+the observed `0.1176 → 0.1228` wobble does not reorder distinct sections, so a rank flip is attributable. The
+second test in the class asserts the floor itself: a threshold just above the best score turns a non-empty result
+set into an empty one, which is the "RAG is silently not grounded" lesson from `docs/GETTING_STARTED.md` proven
+without a model.
+
+`RagStorePersistenceTest` (9 tests, `@TempDir`, no context) covers the restore/persist contract: an upload
+surviving a restart **with the same chunk id**, a corrupt snapshot starting cold instead of bricking boot, a
+`{}` vector file against a non-empty manifest being discarded by the probe, an unchanged shipped document not
+indexed twice, changed bytes replacing only that document, an eviction persisting, a missing directory being
+created before save, and both `enabled=false` / `save-on-write=false`.
+
+**Tier 2 — the same dataset against `all-minilm`.** `LiveRetrievalComparisonTest` is
+`@EnabledIfSystemProperty(named = "app.rag.eval", matches = "true")`, so without the property it reports
+*skipped*, which is green; opting in costs no build-file change. It must override
+`spring.datasource.url` to an in-memory H2 (the file-backed chat memory is exclusively locked while the app runs,
+and tier 2 is exactly the moment both are up) and set `app.rag.store.enabled=false`, because reading
+`./data/rag` would measure whatever the last manual upload left behind. Ranks are **printed, not asserted** — the
+vector leg genuinely struggles with acronym queries and the scores move run to run. `OllamaReachable.orSkip`
+probes first so a stopped backend reads as a skip rather than an error.
+
+**What still needs a real model:** grounded RAG *answers*, token log lines, tool execution, SSE incremental
+delivery, health DOWN with no backend. See `README.md`.

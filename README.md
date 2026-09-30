@@ -90,7 +90,7 @@ scores from that mode are not meaningful.
       ├─ ToolCallingController     ├─► ChatClient ─► advisor chain (stable-sorted)
       ├─ StructuredOutputController│        │   TokenUsageAdvisor          LOWEST_PRECEDENCE - 1
       └─ MultimodalController      ┘        │   MessageChatMemoryAdvisor   window 6  ─► H2 ./data/chat-memory
-                                            │   QuestionAnswerAdvisor      topK 4     ─► SimpleVectorStore (RAM)
+                                            │   QuestionAnswerAdvisor      topK 4     ─► SimpleVectorStore ─► ./data/rag/*.json
                                             ▼
       OpenAI-protocol backend: Ollama · OpenAI · LM Studio · llama.cpp
                                             │
@@ -113,6 +113,8 @@ runs. `TokenUsageAdvisor` uses `LOWEST_PRECEDENCE - 1` for that reason — see
 | **Persisted multi-turn memory** | [`AiConfig.java`](src/main/java/com/example/springai/config/AiConfig.java) | `MessageWindowChatMemory` (6 messages) over the auto-configured JDBC repository and an H2 file database, so transcripts survive a restart. `/chat/memory/history` reads back exactly what the advisor will inject. |
 | **Token accounting** | [`TokenUsageAdvisor.java`](src/main/java/com/example/springai/advisor/TokenUsageAdvisor.java) | Registered with a `ChatClientCustomizer` so *every* client logs prompt/completion/total to the `TOKEN_USAGE` logger; Spring AI also publishes `gen_ai.client.token.usage` to the metrics endpoint. |
 | **RAG + upload + filters + scores** | [`RagController.java`](src/main/java/com/example/springai/controller/RagController.java) | `QuestionAnswerAdvisor` for grounded answers, `POST /rag/documents` for multipart indexing, a `filename` metadata filter, and `GET /rag/search` that surfaces each chunk's cosine score and explains zero matches. |
+| **Knowledge base that survives a restart** | [`RagStorePersistence.java`](src/main/java/com/example/springai/service/RagStorePersistence.java) | `SimpleVectorStore.save`/`load` over two files in `./data/rag`, plus a per-filename SHA-256 manifest so an unchanged shipped document is not re-embedded and a truncated snapshot is discarded loudly instead of silently empty. |
+| **Offline retrieval eval** | [`GoldenQuestionsTest.java`](src/test/java/com/example/springai/rag/GoldenQuestionsTest.java), [`LiveRetrievalComparisonTest.java`](src/test/java/com/example/springai/rag/LiveRetrievalComparisonTest.java) | 15 golden questions with verbatim answer markers, rank-based metrics, and a stub embedder that makes the real cosine/filter/threshold code assertable with Ollama switched off. |
 | **Tool / Function calling** | [`ToolCallingController.java`](src/main/java/com/example/springai/controller/ToolCallingController.java) | `Function<Request, Response>` beans described with `@Description` ([`WeatherToolService`](src/main/java/com/example/springai/service/WeatherToolService.java), [`OrderToolService`](src/main/java/com/example/springai/service/OrderToolService.java)), bound per call with `.toolNames(...)`; the model decides whether to invoke them. |
 | **Structured output** | [`StructuredOutputController.java`](src/main/java/com/example/springai/controller/StructuredOutputController.java) | `responseEntity(...)` parses into the record and keeps the raw completion; a flat answer shape is restated after the schema, an incomplete record retries once, then `422` with `rawModelOutput`. |
 | **Multimodal vision** | [`MultimodalController.java`](src/main/java/com/example/springai/controller/MultimodalController.java) | Server-side download with a `User-Agent`, address-class screening, `Media` attachment on the prompt. |
@@ -288,25 +290,31 @@ verbatim — this is a real response from `?genre=Cyberpunk`, so note that **the
 ```
 
 ### 6. Retrieval-Augmented Generation
-`POST /api/ai/rag/query` — body `{ "question": "...", "topK": 2, "filename": "..." }` (`topK` 0 means the
-configured default; `filename` is an optional metadata filter).
+`POST /api/ai/rag/query` — body `{ "question": "...", "filename": "..." }`, where `filename` is an optional
+metadata filter. How many chunks get injected is `app.rag.top-k`; it is **not** a per-request field, and an
+earlier revision of this record carried a `topK` that the controller never read. That field has been deleted
+rather than wired up, so the published request schema now matches the behaviour.
 
 ```bash
 curl -X POST http://localhost:8080/api/ai/rag/query \
   -H "Content-Type: application/json" \
-  -d '{"question": "How much home office equipment stipend do employees get?", "topK": 2}'
+  -d '{"question": "How much home office equipment stipend do employees get?"}'
 ```
 ```json
 { "question": "How much home office equipment stipend do employees get?",
-  "answer": "Yes, employees are entitled to a $1,500 annual home office equipment stipend. This reimbursement covers ergonomic chairs, dual-monitor setups...",
+  "answer": "Sorry, but I don't have any specific details about home office equipment stipends for employees in this particular context. …",
   "sourceDocuments": [
-    { "filename": "company-policy.md", "score": 0.6073244991101178,
+    { "filename": "company-policy.md", "score": 0.5937717910868997,
       "excerpt": "# Enterprise AI & Remote Work Policies 2026 ## 1. Remote Work & Equipment Employees are entitled to a $1,500 annual home..." },
-    { "filename": "company-policy.md", "score": 0.31739526041164345,
+    { "filename": "company-policy.md", "score": 0.326529790552246,
       "excerpt": "AWS, GCP, Spring certifications), and taking online training courses. ## 3. Leave Policy & Paid Time Off (PTO) - Standar..." }
   ],
-  "responseTimeMs": 1040 }
+  "responseTimeMs": 1579 }
 ```
+
+That response is the lesson, not a bug report: the chunk carrying *"$1,500 annual home office equipment
+stipend"* is right there in `sourceDocuments` at 0.59, and the model still claims it has no details. On another
+run the same request answers it correctly.
 
 `sourceDocuments` comes from the advisor's own retrieval (`QuestionAnswerAdvisor.RETRIEVED_DOCUMENTS`), so the
 citations are literally the chunks that reached the prompt — not a second search that might have matched
@@ -315,9 +323,9 @@ differently. That also means an empty `sourceDocuments` is honest: nothing clear
 `{"question": "failover window", "filename": "ops-runbook.md"}` scored the right chunk at 0.08 and correctly
 returned no citations. Run `/rag/search` with the same query and filename to see the score the threshold
 rejected. Scores are not bit-stable with a local embedder: the same query can read 0.1176 on one run and 0.1228
-on the next, so treat the third decimal as noise. **`answer` is not reproducible either** — the same request
-with the same chunk cited at 0.60 answered the stipend correctly on one call and claimed "You haven't mentioned
-any specific instance of a home office equipment stipend" on the next. Trust `sourceDocuments`, not the prose.
+on the next, so treat the third decimal as noise. **`answer` is not reproducible either** — the refusal above is
+one sample of it; the next run of the same request names the $1,500 correctly. Trust `sourceDocuments`, not the
+prose.
 
 #### Raw vector similarity search
 `GET /api/ai/rag/search?query=...&topK=...&filename=...`
@@ -345,6 +353,44 @@ curl "http://localhost:8080/api/ai/rag/search?query=failover&topK=2&filename=ops
 
 Re-uploading a filename **replaces** its previous chunks, so iterating on a document does not double its
 presence in every answer.
+
+#### What the knowledge base does on restart
+
+The store is in memory while the process runs and is snapshotted to disk on every index change, so an upload
+here survives a restart. Two files, one owner each:
+
+```
+data/rag/vector-store.json   # Spring AI's own serialization of SimpleVectorStore — opaque to this repo
+data/rag/rag-store.json      # ours: { "version": 1, "checksums": { "<filename>": "<sha256>" } }
+```
+
+```bash
+curl -X POST http://localhost:8080/api/ai/rag/documents -F "file=@target/ops-runbook.md"
+# [RAG-STORE] Restored snapshot from .\data\rag (2 document checksum(s))
+# [RAG-INGESTION] Kept persisted chunks for company-policy.md (unchanged)
+curl "http://localhost:8080/api/ai/rag/search?query=failover&topK=2&filename=ops-runbook.md"   # still there
+```
+
+A restore needs **both** files; either missing or unreadable is a cold start plus a `WARN`, never a failed
+boot. The checksums exist because `VectorStore` has no scan API, so "is this document already indexed?" cannot
+otherwise be answered without calling the embedder — which is exactly the thing that may be offline at boot.
+An unchanged shipped document is therefore not re-embedded, and a changed one is replaced by filename alone,
+leaving uploads untouched.
+
+Two deliberate edges:
+
+- A snapshot that parses but answers no query is **discarded loudly**. Truncate `vector-store.json` to `{}` and
+  the next boot says so:
+  `[RAG-STORE] Discarding stale or partial vector snapshot in .\data\rag: 2 document(s) listed as indexed but
+  the store answers no query`, then re-indexes the shipped documents. Without that probe the log would claim the
+  chunks were kept while the knowledge base was empty.
+- The integrity probe embeds a query, so it can only run when the embedder can. When it cannot, the snapshot is
+  kept and the probe is skipped at `DEBUG`: re-indexing would fail for the same reason, and the store would only
+  end up emptier.
+
+`app.rag.store.enabled` / `.directory` / `.save-on-write` (env: `RAG_STORE_ENABLED`, `RAG_STORE_DIRECTORY`,
+`RAG_STORE_SAVE_ON_WRITE`) control this; `enabled=false` writes nothing at all, which is what the eval harness
+uses to stay reproducible from the repository alone.
 
 ### 7. Dynamic tool / function calling
 The model inspects the prompt and decides whether to call a tool; Spring AI executes the Java method and feeds
@@ -383,10 +429,33 @@ Pick the URL yourself — the endpoint takes no default asset. Requirements, lea
 ## 🛠 Build, test, package
 
 ```bash
-mvn -B test              # 19 tests; standalone MockMvc + proxy-faked ChatClient, so no Spring context and no model calls
+mvn -B test              # 32 tests — 31 run offline, 1 skipped, no model calls: standalone MockMvc +
+                         # proxy-faked ChatClient, a stub embedder for the RAG store, @TempDir for the
+                         # persistence tests
+mvn -B test -Dapp.rag.eval=true   # runs the skipped one too: the golden questions re-measured against the live
+                                  # all-minilm. Opt-in because it boots the context and needs Ollama; without
+                                  # the property the class is skipped, which is green, and no build file changes
 mvn clean package -DskipTests
 java -jar target/spring-ai-showcase-1.0.0-SNAPSHOT.jar
 ```
+
+The eval dataset lives in [`src/test/resources/rag/golden-questions.json`](src/test/resources/rag/golden-questions.json):
+15 questions, each naming the document it is filtered to and the **verbatim** chunk text that answers it. A
+`match` row passes when a chunk carrying that marker ranks inside its budget; a `nomatch` row asserts that
+nothing indexed carries it. Both tiers search with no threshold, so a score floor can only ever be what the
+application is configured with — never what the metric quietly measured. The gates are on rank because scores
+drift, and rank is what the two tiers actually agree on: **all 13 `match` rows land at rank 1** with the stub
+embedder and with live `all-minilm` (MRR 1.000 both ways), while the two `nomatch` rows find no gold chunk — at
+scores of 0.182 and **0.407** on one run, 0.190 and **0.405** on a re-measurement. That second number is the
+finding worth carrying into any retrieval change here: an unanswerable question outranked three genuine matches
+(`pii-prohibition` 0.345, `failover-from-runbook` 0.299, `acronym-pii` 0.158), so **a cosine floor cannot tell an
+answerable question from an unanswerable one** — and `acronym-pii` ranks first at 0.158, under the app's 0.2
+floor, which is the same chunk both correctly retrieved and correctly dropped.
+
+Tier 2 talks to the real backend, so it needs the same environment as the app
+(`OPENAI_BASE_URL=http://localhost:11434`, `OPENAI_EMBEDDING_MODEL=all-minilm`, …). Without it the class reports
+**skipped, not failed** — boot's ingestion cannot reach the default base URL, the store stays empty, and the
+reachability probe turns the run into a skip. Confusing, but the right direction for a mistake.
 
 To stop a dev server on Windows: `netstat -ano | grep :8080` → `taskkill //PID <pid> //F`.
 

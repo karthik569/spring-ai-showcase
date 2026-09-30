@@ -172,8 +172,8 @@ Now the grounded answer, with citations:
 
 ```bash
 curl -X POST http://localhost:8080/api/ai/rag/query -H "Content-Type: application/json" \
-  -d '{"question":"How much home office equipment stipend do employees get?","topK":2}'
-# → sourceDocuments[0] = company-policy.md, score ≈0.60, excerpt "…$1,500 annual home…"
+  -d '{"question":"How much home office equipment stipend do employees get?"}'
+# → sourceDocuments[0] = company-policy.md, score ≈0.59, excerpt "…$1,500 annual home…"
 #   answer: "Employees are entitled to a $1,500 annual home office equipment stipend."
 ```
 
@@ -200,7 +200,7 @@ curl "http://localhost:8080/api/ai/rag/search?query=when+is+failover+allowed%3F&
 # → one result, score 0.1118, filename ops-runbook.md   ← the chunk IS there
 
 curl -X POST http://localhost:8080/api/ai/rag/query -H "Content-Type: application/json" \
-  -d '{"question":"when is failover allowed?","topK":3,"filename":"ops-runbook.md"}'
+  -d '{"question":"when is failover allowed?","filename":"ops-runbook.md"}'
 # → answer: "Sorry, but I don't have enough context or history data to determine when failover is allowed…"
 #   sourceDocuments: []
 ```
@@ -222,11 +222,37 @@ mvn -B spring-boot:run -Dspring-boot.run.arguments=--app.rag.similarity-threshol
 Same question, same chunks, same model — the only difference is a number in a config file, and the only
 evidence is the citation list.
 
-> Uploaded documents live in an **in-memory** vector store: they are gone after a restart. The shipped
-> `classpath:/docs/company-policy.md` is re-ingested at boot; your upload is not.
+There is a version of that experiment you can run with the model switched off. `mvn -B test` indexes the same
+policy document into the same store, embeds it with a deterministic term-hash stub, and checks 15 golden
+questions by **rank**: does the chunk that literally contains *"$1,500 annual home office equipment stipend"*
+come back first? It does, for all 13 answerable rows, and the stub tier asserts exactly that — so if a change
+reorders retrieval you find out in 6 seconds with Ollama off. `mvn -B test -Dapp.rag.eval=true` re-runs the
+identical dataset against the live `all-minilm` and prints the table without asserting on it, because real scores
+drift. Run it with the same `OPENAI_*` environment as the app: without a reachable embedder the store indexes
+nothing and the class reports *skipped* rather than failed. On the run that produced the numbers above, every
+match ranked first — and the top score for a question the corpus **cannot** answer (0.405) beat three of the
+genuine matches. Rank and score are measuring different things here, which is the whole reason the gate is on
+rank.
+
+> **Now restart the app — the upload is still there.** Every index change snapshots the store into `data/rag/`:
+> `vector-store.json` is Spring AI's own serialization, `rag-store.json` is this repo's per-filename SHA-256
+> manifest. Re-run the search above after the restart and you get the *same chunk id* back. The boot log
+> changes shape too:
+>
+> ```
+> [RAG-STORE] Restored snapshot from .\data\rag (2 document checksum(s))
+> [RAG-INGESTION] Kept persisted chunks for company-policy.md (unchanged)
+> ```
+>
+> — no `Indexed 3 chunks` line, because the shipped document's bytes still hash to what the manifest recorded,
+> so it is not re-embedded at all. That is the whole reason a manifest sits next to the snapshot: `VectorStore`
+> has no scan API, so "already indexed?" cannot be answered without calling the embedder, and the embedder is
+> the thing that may be offline at boot. Set `app.rag.store.enabled=false` to get the old behaviour back:
+> re-ingest every boot, uploads lost.
 
 Code: [`RagController`](../src/main/java/com/example/springai/controller/RagController.java),
-[`RagDocumentIngestionService`](../src/main/java/com/example/springai/service/RagDocumentIngestionService.java).
+[`RagDocumentIngestionService`](../src/main/java/com/example/springai/service/RagDocumentIngestionService.java),
+[`RagStorePersistence`](../src/main/java/com/example/springai/service/RagStorePersistence.java).
 
 ### Step 4 — tool calling: the model decides, and you can prove it ran
 
@@ -312,6 +338,7 @@ Code: [`StructuredOutputController`](../src/main/java/com/example/springai/contr
 7. `StructuredOutputController` → `ToolCallingController` → `MultimodalController`.
 8. [`GlobalExceptionHandler.java`](../src/main/java/com/example/springai/error/GlobalExceptionHandler.java) — what production error contracts look like for a model call.
 9. `src/test/java/…/ControllerIntegrationTest.java` — how to test controllers that call a model **without** calling a model.
+10. [`RagStorePersistenceTest.java`](../src/test/java/com/example/springai/service/RagStorePersistenceTest.java) and [`GoldenQuestionsTest.java`](../src/test/java/com/example/springai/rag/GoldenQuestionsTest.java) — the two offline patterns behind §Step 3: a restart simulated with `@TempDir`, and retrieval asserted by rank.
 
 ---
 
@@ -322,7 +349,13 @@ Code: [`StructuredOutputController`](../src/main/java/com/example/springai/contr
 2. **RAG needs a second, real embedding model.** `OPENAI_EMBEDDING_MODEL=all-minilm`. A chat model as
    embedder gives you a working pipeline with random scores.
 3. **`conversationId` is 36 characters or fewer** — the memory schema column is `VARCHAR(36)`.
-4. **Uploads disappear on restart** (in-memory vector store); chat memory does not (H2 file).
+4. **`./data/rag/` is now your knowledge base.** Uploads survive a restart, which means the answers you get
+   depend on files gitignored next to the H2 database: delete the directory and the uploads are gone, keep it
+   and a stale document keeps citing. One consequence is not obvious — chunks are keyed by **filename**, so
+   uploading a file named like a shipped one (`company-policy.md`) evicts the shipped chunks immediately, and
+   the next boot evicts yours and re-indexes the shipped document, because its bytes no longer match the
+   checksum your upload recorded. Verified: 3 shipped chunks → upload that name → 1 chunk → restart → 3 chunks,
+   and the uploaded text is unrecoverable. Rename the file if you meant to add, not to shadow.
 5. **One app instance at a time.** The H2 file in `./data/` is exclusively locked, so a second
    `mvn -B spring-boot:run` in another terminal dies with `Failed to determine DatabaseDriver` — which looks
    like a datasource typo and is really "something is already running on this database file". Same reason you
