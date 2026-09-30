@@ -323,8 +323,11 @@ Code: [`StructuredOutputController`](../src/main/java/com/example/springai/contr
    embedder gives you a working pipeline with random scores.
 3. **`conversationId` is 36 characters or fewer** — the memory schema column is `VARCHAR(36)`.
 4. **Uploads disappear on restart** (in-memory vector store); chat memory does not (H2 file).
-5. **`mvn -B test` and `spring-boot:run` both use `target/classes`** — stop the running app before running the
-   suite, especially on Windows.
+5. **One app instance at a time.** The H2 file in `./data/` is exclusively locked, so a second
+   `mvn -B spring-boot:run` in another terminal dies with `Failed to determine DatabaseDriver` — which looks
+   like a datasource typo and is really "something is already running on this database file". Same reason you
+   stop the app before `mvn -B test`: both use `target/classes`, and Windows locks `.class` files under a live
+   JVM.
 
 Judge the plumbing, not the prose: `qwen2.5:0.5b-instruct` is 494M parameters and will invent facts inside
 valid JSON. Every "wrong answer" in this document was produced on purpose to show what the *code* still gets

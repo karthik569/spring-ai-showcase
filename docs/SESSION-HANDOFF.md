@@ -8,9 +8,10 @@ Not project documentation — see `docs/GETTING_STARTED.md` (on-ramp), `README.m
 + `all-minilm` embeddings). The upgrade, the new capabilities (RAG upload/filters/scores, persisted memory +
 history, token metrics, demo UI, Swagger, timeouts/health/concurrency) are **done and verified live**, and
 `README.md` / `ARCHITECTURE_AND_METHODS.md` now describe them, and **`docs/GETTING_STARTED.md`** is the new
-beginner on-ramp (prerequisites, plain-language glossary, five verified steps in learning order) — that file and
-the README pointer are **not yet committed**. The upgrade itself is `e1b9ade` (+ `2b35ca4`, which recorded the
-SHA) and **both are pushed** to `origin/main`.
+beginner on-ramp (prerequisites, plain-language glossary, five verified steps in learning order) — committed as
+`cf28b41` along with the README pointer. The upgrade itself is `e1b9ade` (+ `2b35ca4`, which recorded the SHA).
+Rather than restating push state here (it went stale twice), check it: `git log --oneline origin/main..HEAD`
+lists whatever is still local.
 
 ## Environment (this machine)
 
@@ -94,6 +95,11 @@ mvn -B spring-boot:run > run.log 2>&1 &
   session, and `ollama.exe` was gone too). Symptoms: `curl` → `HTTP 000` / exit 7 on 8080 or 11434. Restart
   `ollama serve` first, then the app — an app that booted without a backend has an **empty vector store** and
   must be restarted to re-ingest `classpath:/docs/*.md`.
+- **A second app instance does not fail on the port — it fails on the H2 file lock**, and the message is
+  misleading. Reproduced: `Failed to determine DatabaseDriver` → `CannotGetJdbcConnectionException` →
+  `The file is locked: …/data/chat-memory.mv.db`. It reads like a datasource misconfiguration; it only means an
+  instance is already running. Check `netstat -ano | grep ":8080 .*LISTENING"` (then
+  `powershell Get-Process -Id <pid>` to confirm it is java) before touching `spring.datasource`.
 - **Windows `curl.exe` cannot read Git Bash `/tmp` paths** — it returns `HTTP 000` with no body. Write scratch
   files under `target/` and use a relative path for `-F file=@…`.
 - **Driving the browser without npm**: Node 22's global `WebSocket` + Edge `--remote-debugging-port=9222` speaks
@@ -175,10 +181,11 @@ moves them.
 
 ## Open work
 
-1. **`e1b9ade` and `2b35ca4` are pushed to `origin/main`.** Uncommitted since then: the new
-   `docs/GETTING_STARTED.md` plus the README pointer and the edits that produced this line. `data/` and the root
-   `run*.log` / `ollama.log` / `pull.log` scratch files are gitignored, so they stay out of commits — deleting
-   them is safe but unnecessary.
+1. **Doc commits stack; push state is checkable, not documented.** `e1b9ade` (upgrade) → `2b35ca4` (recorded
+   that SHA) → `cf28b41` (beginner on-ramp + README pointer) → the commit that records `cf28b41`.
+   `git log --oneline origin/main..HEAD` lists whatever is still local; `git status` should be clean. `data/`
+   and the root `run*.log` / `ollama.log` / `pull.log` scratch files are gitignored, so they stay out of
+   commits — deleting them is safe but unnecessary.
 2. **No `LICENSE` file and no `<licenses>` in `pom.xml`.** The repo is on GitHub; a newcomer cannot tell what
    they may copy. Needs an author decision, not a code change.
 3. **No Maven wrapper** (`mvnw`, `mvnw.cmd`, `.mvn/` are absent, though `.gitignore` already has a
