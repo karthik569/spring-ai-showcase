@@ -222,17 +222,62 @@ mvn -B spring-boot:run -Dspring-boot.run.arguments=--app.rag.similarity-threshol
 Same question, same chunks, same model — the only difference is a number in a config file, and the only
 evidence is the citation list.
 
+There is a second way to land in that same empty-handed state, and it needs no config change at all: ask
+something on a topic, then ask a follow-up that refers back to it.
+
+```bash
+curl -X POST http://localhost:8080/api/ai/rag/query -H "Content-Type: application/json" \
+  -d '{"question":"What is the home office equipment stipend?","conversationId":"step3"}'
+curl -X POST http://localhost:8080/api/ai/rag/query -H "Content-Type: application/json" \
+  -d '{"question":"how long do I have to submit that?","conversationId":"step3"}'
+# → resolvedQuestion: "How long do you have to submit the home office equipment stipend?"
+#   followUpOutcome: REWRITTEN, rewriteTimeMs: 325
+#   sourceDocuments[0] = the chunk that contains "within 30 days of purchase", score 0.47
+```
+
+Search the pronoun instead and you get a different picture, which `/rag/search` shows without a model call:
+
+```bash
+curl "http://localhost:8080/api/ai/rag/search?query=how+long+do+I+have+to+submit+that%3F&topK=1&filename=company-policy.md"
+# → one result, score 0.2185, and that chunk does NOT contain the 30-day rule   ← plausible, wrong
+```
+
+That is the same failure as the runbook above — a chunk that clears the floor and cannot answer — only now the
+reason is an unresolved *that*, and the citation list alone would not tell you: it looks like a real match. So
+`/rag/query` reports `resolvedQuestion` on every response, including the ones where nothing was rewritten
+(`followUpOutcome` says why: `NO_CONVERSATION`, `EMPTY_MEMORY`, `PASSTHROUGH`, `DISABLED`, …), and the demo page
+prints it above the answer. Two things this deliberately does **not** do:
+
+- it is not an advisor. `QuestionAnswerAdvisor` builds its search from the user message text and then replaces
+  that text, while `MessageChatMemoryAdvisor` injects history as *separate* messages — so memory is in the prompt
+  before retrieval runs and is still invisible to the retrieval query. Attaching the memory advisor to the RAG
+  client changes nothing here; the query string itself has to become standalone first. Read
+  [`ARCHITECTURE_AND_METHODS.md`](../ARCHITECTURE_AND_METHODS.md) §2 for the bytecode-level note, and treat this as
+  the repo's second lesson in *"the advisor you assumed was doing it wasn't"*.
+- it does not fix the model. On the run above the retrieval handed the 0.5B model the right chunk at 0.47 and the
+  answer still came back "the context does not mention…". Citations are the evidence; the prose is the ceiling.
+
+The cost is one extra serial model call — 325–595 ms and ~126–148 tokens here, against a 1.1–2.1 s baseline. Set
+`RAG_FOLLOW_UP_ENABLED=false` and the endpoint is the single-shot one it was before: `followUpOutcome` becomes
+`DISABLED`, `resolvedQuestion` echoes your text, no rewrite call, and no RAG turn written to chat memory. Note
+too that these turns share the six-message window with `/chat/memory`, so a RAG exchange displaces two chat
+messages there.
+
 There is a version of that experiment you can run with the model switched off. `mvn -B test` indexes the same
 policy document into the same store, embeds it with a deterministic term-hash stub, and checks 15 golden
 questions by **rank**: does the chunk that literally contains *"$1,500 annual home office equipment stipend"*
 come back first? It does, for all 13 answerable rows, and the stub tier asserts exactly that — so if a change
-reorders retrieval you find out in 6 seconds with Ollama off. `mvn -B test -Dapp.rag.eval=true` re-runs the
-identical dataset against the live `all-minilm` and prints the table without asserting on it, because real scores
-drift. Run it with the same `OPENAI_*` environment as the app: without a reachable embedder the store indexes
-nothing and the class reports *skipped* rather than failed. On the run that produced the numbers above, every
-match ranked first — and the top score for a question the corpus **cannot** answer (0.405) beat three of the
-genuine matches. Rank and score are measuring different things here, which is the whole reason the gate is on
-rank.
+reorders retrieval you find out in 6 seconds with Ollama off. The same offline run asserts the follow-up table
+too ([`FollowUpRetrievalTest`](../src/test/java/com/example/springai/rag/FollowUpRetrievalTest.java)), and that
+one *does* apply the 0.2 floor, because a follow-up's failure mode is its gold chunk scoring 0.07 on the stub and
+being dropped outright — no threshold-free search can see it. On the stub: unresolved retrieves nothing,
+resolved retrieves the answer at 0.248. `mvn -B test -Dapp.rag.eval=true` re-runs both datasets against the live
+`all-minilm` and prints the tables without asserting on them, because real scores drift — live, two of the three
+follow-ups already rank 1 unresolved, which is why the win is stated as floor and honesty rather than rank. Run
+it with the same `OPENAI_*` environment as the app: without a reachable embedder the store indexes nothing and
+the class reports *skipped* rather than failed. On the run that produced the numbers above, every match ranked
+first — and the top score for a question the corpus **cannot** answer (0.405) beat three of the genuine matches.
+Rank and score are measuring different things here, which is the whole reason the gate is on rank.
 
 > **Now restart the app — the upload is still there.** Every index change snapshots the store into `data/rag/`:
 > `vector-store.json` is Spring AI's own serialization, `rag-store.json` is this repo's per-filename SHA-256
@@ -251,6 +296,7 @@ rank.
 > re-ingest every boot, uploads lost.
 
 Code: [`RagController`](../src/main/java/com/example/springai/controller/RagController.java),
+[`RagQueryResolver`](../src/main/java/com/example/springai/service/RagQueryResolver.java),
 [`RagDocumentIngestionService`](../src/main/java/com/example/springai/service/RagDocumentIngestionService.java),
 [`RagStorePersistence`](../src/main/java/com/example/springai/service/RagStorePersistence.java).
 

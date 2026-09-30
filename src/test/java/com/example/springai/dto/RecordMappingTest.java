@@ -58,18 +58,28 @@ class RecordMappingTest {
     @Test
     void testRagQueryDtoSerialization() throws Exception {
         RagQueryResponse ragResponse = new RagQueryResponse(
-                "What is the PTO policy?",
-                "25 days annual leave.",
-                List.of(new RetrievedChunk("company-policy.md", 0.61, "25 days annual leave")),
+                "and how long do I have to submit that?",
+                "What is the reimbursement window for the home office equipment stipend?",
+                true,
+                "REWRITTEN",
+                240L,
+                "Within 30 days of purchase.",
+                List.of(new RetrievedChunk("company-policy.md", 0.61, "within 30 days of purchase")),
                 120L
         );
 
         String json = objectMapper.writeValueAsString(ragResponse);
         assertNotNull(json);
-        assertTrue(json.contains("25 days annual leave"));
+        assertTrue(json.contains("within 30 days of purchase"));
+        // The searched text is part of the wire contract, not a debug field: a reader needs it to judge the
+        // citations.
+        assertTrue(json.contains("resolvedQuestion"));
 
         RagQueryResponse deserialized = objectMapper.readValue(json, RagQueryResponse.class);
         assertEquals(ragResponse.question(), deserialized.question());
+        assertEquals(ragResponse.resolvedQuestion(), deserialized.resolvedQuestion());
+        assertEquals(ragResponse.followUpResolved(), deserialized.followUpResolved());
+        assertEquals(ragResponse.followUpOutcome(), deserialized.followUpOutcome());
         assertEquals(ragResponse.answer(), deserialized.answer());
         assertEquals(ragResponse.responseTimeMs(), deserialized.responseTimeMs());
     }

@@ -1,13 +1,12 @@
 package com.example.springai.controller;
 
+import com.example.springai.support.ConversationIds;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.memory.ChatMemory;
 import org.springframework.ai.chat.messages.Message;
 import org.springframework.beans.factory.annotation.Qualifier;
-import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.*;
-import org.springframework.web.server.ResponseStatusException;
 import reactor.core.publisher.Flux;
 
 import java.util.LinkedHashMap;
@@ -17,9 +16,6 @@ import java.util.Map;
 @RestController
 @RequestMapping("/api/ai/chat")
 public class ChatController {
-
-    // The chat memory schema stores the id in VARCHAR(36); a longer value fails on insert, deep inside JDBC.
-    private static final int MAX_CONVERSATION_ID_CHARS = 36;
 
     private final ChatClient chatClient;
     private final ChatClient conversationalChatClient;
@@ -61,7 +57,7 @@ public class ChatController {
             @RequestParam(defaultValue = "Write a haiku about Java programming") String message,
             @RequestParam(defaultValue = "session-123") String conversationId) {
 
-        String conversation = requireConversationId(conversationId);
+        String conversation = ConversationIds.requireNonBlank(conversationId);
         return conversationalChatClient.prompt()
                 .user(message)
                 .advisors(a -> a.param(ChatMemory.CONVERSATION_ID, conversation))
@@ -76,7 +72,7 @@ public class ChatController {
             @RequestParam String message,
             @RequestParam(defaultValue = "session-123") String conversationId) {
 
-        String conversation = requireConversationId(conversationId);
+        String conversation = ConversationIds.requireNonBlank(conversationId);
         String response = conversationalChatClient.prompt()
                 .user(message)
                 .advisors(a -> a.param(ChatMemory.CONVERSATION_ID, conversation))
@@ -96,7 +92,7 @@ public class ChatController {
      */
     @GetMapping("/memory/history")
     public Map<String, Object> conversationHistory(@RequestParam String conversationId) {
-        List<Message> messages = chatMemory.get(requireConversationId(conversationId));
+        List<Message> messages = chatMemory.get(ConversationIds.requireNonBlank(conversationId));
 
         List<Map<String, Object>> transcript = messages.stream()
                 .map(message -> {
@@ -116,19 +112,8 @@ public class ChatController {
 
     @DeleteMapping("/memory")
     public Map<String, Object> clearConversation(@RequestParam String conversationId) {
-        String id = requireConversationId(conversationId);
+        String id = ConversationIds.requireNonBlank(conversationId);
         chatMemory.clear(id);
         return Map.of("conversationId", id, "cleared", true);
-    }
-
-    private static String requireConversationId(String conversationId) {
-        if (conversationId == null || conversationId.isBlank()) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "conversationId must not be blank");
-        }
-        if (conversationId.length() > MAX_CONVERSATION_ID_CHARS) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
-                    "conversationId is limited to " + MAX_CONVERSATION_ID_CHARS + " characters");
-        }
-        return conversationId;
     }
 }

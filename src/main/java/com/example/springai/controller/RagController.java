@@ -4,6 +4,7 @@ import com.example.springai.dto.RagQueryRequest;
 import com.example.springai.dto.RagQueryResponse;
 import com.example.springai.dto.RetrievedChunk;
 import com.example.springai.service.RagDocumentIngestionService;
+import com.example.springai.service.RagQueryResolver;
 import jakarta.validation.Valid;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -43,15 +44,18 @@ public class RagController {
     private final ChatClient chatClient;
     private final VectorStore vectorStore;
     private final RagDocumentIngestionService ingestionService;
+    private final RagQueryResolver queryResolver;
     private final int defaultTopK;
 
     public RagController(ChatClient.Builder chatClientBuilder,
                          VectorStore vectorStore,
                          RagDocumentIngestionService ingestionService,
+                         RagQueryResolver queryResolver,
                          @Value("${app.rag.top-k:4}") int defaultTopK,
                          @Value("${app.rag.similarity-threshold:0.5}") double similarityThreshold) {
         this.vectorStore = vectorStore;
         this.ingestionService = ingestionService;
+        this.queryResolver = queryResolver;
         this.defaultTopK = defaultTopK;
         this.chatClient = chatClientBuilder
                 .defaultAdvisors(QuestionAnswerAdvisor.builder(vectorStore)
@@ -67,8 +71,11 @@ public class RagController {
     public RagQueryResponse queryKnowledgeBase(@Valid @RequestBody RagQueryRequest request) {
         long start = System.currentTimeMillis();
 
+        // Resolved before the advisor runs, because the advisor reads the user message text and then replaces it.
+        RagQueryResolver.Resolution resolution = queryResolver.resolve(request.question(), request.conversationId());
+
         ChatClientResponse response = chatClient.prompt()
-                .user(request.question())
+                .user(resolution.retrievalQuery())
                 .advisors(advisors -> {
                     if (hasText(request.filename())) {
                         advisors.param(QuestionAnswerAdvisor.FILTER_EXPRESSION,
@@ -82,8 +89,11 @@ public class RagController {
         // Reported from the advisor's own retrieval, so the citations are literally the text the model was
         // given — a second search with different settings could advertise chunks that never reached the prompt.
         List<RetrievedChunk> sources = chunksOf(response.context().get(QuestionAnswerAdvisor.RETRIEVED_DOCUMENTS));
+        queryResolver.remember(request.conversationId(), request.question(), answer);
 
-        return new RagQueryResponse(request.question(), answer, sources, System.currentTimeMillis() - start);
+        return new RagQueryResponse(request.question(), resolution.retrievalQuery(), resolution.followUpResolved(),
+                resolution.outcome().name(), resolution.rewriteTimeMs(), answer, sources,
+                System.currentTimeMillis() - start);
     }
 
     // An inspection endpoint: an empty list must not look like an empty store, so the reason for zero

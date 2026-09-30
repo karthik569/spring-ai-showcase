@@ -1,0 +1,38 @@
+[
+  {
+    "id": "follow-up-stipend-window",
+    "followUp": "how long do I have to submit that?",
+    "contextQuestion": "What is the home office equipment stipend?",
+    "contextAnswer": "Employees are entitled to a $1,500 annual home office equipment stipend.",
+    "resolved": "What is the reimbursement window for the home office equipment stipend?",
+    "filename": "company-policy.md",
+    "marker": "within 30 days of purchase",
+    "topK": 3,
+    "expectRaw": "miss",
+    "maxFirstHitRankResolved": 1
+  },
+  {
+    "id": "follow-up-conference-budget",
+    "followUp": "and what's the budget for that?",
+    "contextQuestion": "What does the remote work stipend cover?",
+    "contextAnswer": "Employees are entitled to a $1,500 annual home office equipment stipend covering chairs, monitors and desks.",
+    "resolved": "What is the annual budget for technical conferences and training?",
+    "filename": "company-policy.md",
+    "marker": "$2,500 annual budget",
+    "topK": 3,
+    "expectRaw": "hit",
+    "maxFirstHitRankResolved": 1
+  },
+  {
+    "id": "follow-up-caregivers",
+    "followUp": "and for caregivers?",
+    "contextQuestion": "How much annual leave do employees get?",
+    "contextAnswer": "Standard PTO is 25 days of annual leave plus 10 company holidays.",
+    "resolved": "How much paid parental leave do primary and secondary caregivers get?",
+    "filename": "company-policy.md",
+    "marker": "16 weeks of fully paid leave",
+    "topK": 3,
+    "expectRaw": "hit",
+    "maxFirstHitRankResolved": 1
+  }
+]

@@ -1,6 +1,8 @@
 package com.example.springai.rag;
 
 import com.example.springai.SpringAiApplication;
+import com.example.springai.rag.GoldenQuestions.FollowUp;
+import com.example.springai.rag.GoldenQuestions.FollowUpRow;
 import com.example.springai.rag.GoldenQuestions.GoldenQuestion;
 import com.example.springai.rag.GoldenQuestions.Row;
 import com.example.springai.service.RagDocumentIngestionService;
@@ -9,6 +11,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 import org.springframework.ai.vectorstore.VectorStore;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.core.io.ClassPathResource;
 
@@ -48,6 +51,10 @@ class LiveRetrievalComparisonTest {
     @Autowired
     private RagDocumentIngestionService ingestion;
 
+    /** The floor the application actually serves with, because a follow-up's failure mode is defined by it. */
+    @Value("${app.rag.similarity-threshold:0.2}")
+    private double similarityThreshold;
+
     @Test
     void reportsLiveRetrievalRanks() throws IOException {
         // Probe first: with the backend down, the ingest below would throw and read as a failure rather than
@@ -72,5 +79,31 @@ class LiveRetrievalComparisonTest {
                         row.id() + " claims nothing answers it, yet a chunk carries its marker"));
         assertTrue(rows.stream().anyMatch(row -> "match".equals(row.expect()) && row.rank() > 0),
                 "the live store answered nothing — is the embedding model running?");
+    }
+
+    /**
+     * The follow-up table against the live vectors, reported and never gated.
+     *
+     * <p>Tier 1 asserts the shape of this dataset on the stub, where the numbers are deterministic. Here the
+     * same rows move between runs: {@code all-minilm} puts two of these three raw follow-ups at rank 1 and the
+     * third's gold chunk straddles the shipped 0.2 floor, so a rank or cosine assertion would fail on drift
+     * rather than on a regression. What the print is for is the floor — the one live consequence Phase 0 found
+     * and the reason this feature exists at all — so an operator changing
+     * {@code app.rag.similarity-threshold} can see what the change costs before shipping it.
+     */
+    @Test
+    void reportsLiveFollowUpRanksAgainstTheServedFloor() throws IOException {
+        OllamaReachable.orSkip(vectorStore);
+
+        List<FollowUp> questions = GoldenQuestions.loadFollowUps();
+        List<FollowUpRow> rows = GoldenQuestions.measureFollowUps(vectorStore, questions, similarityThreshold);
+        List<String> beyondBudget = GoldenQuestions.gateFollowUps(rows);
+
+        System.out.println(GoldenQuestions.followUpTable("live embedder (all-minilm)", similarityThreshold,
+                rows, List.of()));
+        System.out.println("Report-only tier: the budgets above are tier 1's. Rows that would miss them: "
+                + (beyondBudget.isEmpty() ? "none" : "\n  - " + String.join("\n  - ", beyondBudget)));
+
+        assertEquals(questions.size(), rows.size());
     }
 }

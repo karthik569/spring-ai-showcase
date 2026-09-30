@@ -75,6 +75,17 @@ app:
     # cutoff above ~0.4 silently drops the context and the model answers from memory.
     similarity-threshold: 0.2
     top-k: 4
+    follow-up:
+      # Rewrites "and what about travel?" into a standalone question before the retrieval advisor sees it, and
+      # stores RAG turns in the same chat memory so the next follow-up has an antecedent. Costs one extra model
+      # call: 325-595 ms on a turn whose baseline /rag/query was 1.1-2.1 s, so budget roughly +20-60 % on the
+      # turns that get resolved and nothing on the ones skipped for want of a conversation.
+      enabled: ${RAG_FOLLOW_UP_ENABLED:true}
+      max-history-turns: 2
+      max-query-chars: 300
+      # Only rewrite questions holding a demonstrative or starting with a conjunction. Default false: a missed
+      # rewrite is invisible, a slow one is not, and this trigger is a closed-class guess over a 494M model.
+      require-trigger: ${RAG_FOLLOW_UP_REQUIRE_TRIGGER:false}
     store:
       # SimpleVectorStore is in memory; this writes it to two files on startup and reads them back, which is
       # what makes POST /rag/documents survive a restart. Turn it off for a throwaway knowledge base.

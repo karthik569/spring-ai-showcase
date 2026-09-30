@@ -68,8 +68,13 @@ public final class GoldenQuestions {
      * answer text, so the check is provenance rather than a human reading of an embedding.
      */
     public static Predicate<Document> gold(GoldenQuestion question) {
-        return doc -> question.filename().equals(String.valueOf(doc.getMetadata().get("filename")))
-                && doc.getText() != null && doc.getText().contains(question.marker());
+        return gold(question.filename(), question.marker());
+    }
+
+    /** The same rule with the parts spelled out, for rows that are not {@link GoldenQuestion}s. */
+    public static Predicate<Document> gold(String filename, String marker) {
+        return doc -> filename.equals(String.valueOf(doc.getMetadata().get("filename")))
+                && doc.getText() != null && doc.getText().contains(marker);
     }
 
     public static List<Row> measure(VectorStore store, List<GoldenQuestion> questions) {
@@ -135,13 +140,141 @@ public final class GoldenQuestions {
         return report.toString();
     }
 
+    /**
+     * A follow-up plus the antecedent it depends on. Separate rows from {@link GoldenQuestion} because the
+     * shipped 15 have rank budgets calibrated by running them, and a follow-up row has to be able to expect a
+     * <em>miss</em> unresolved — a budget of 0 means something different in each dataset.
+     */
+    public record FollowUp(String id, String followUp, String contextQuestion, String contextAnswer,
+                           String resolved, String filename, String marker, int topK,
+                           String expectRaw, int maxFirstHitRankResolved) {
+    }
+
+    /**
+     * @param rawRank     1-based rank of the gold chunk for the question as typed; 0 means the floor dropped it
+     * @param rawGold     the gold chunk's cosine under the raw question, or {@code NaN} when nothing carried it
+     * @param expectRaw   copied from the row: {@code hit} or {@code miss}
+     */
+    public record FollowUpRow(String id, int rawRank, double rawGold, int resolvedRank, double resolvedGold,
+                              String expectRaw, int maxFirstHitRankResolved) {
+    }
+
+    public static List<FollowUp> loadFollowUps() throws IOException {
+        try (InputStream in = new ClassPathResource("rag/follow-up-questions.json").getInputStream()) {
+            List<FollowUp> rows = new ArrayList<>();
+            for (JsonNode node : MAPPER.readTree(in)) {
+                rows.add(new FollowUp(
+                        node.path("id").asText(),
+                        node.path("followUp").asText(),
+                        node.path("contextQuestion").asText(),
+                        node.path("contextAnswer").asText(),
+                        node.path("resolved").asText(),
+                        node.path("filename").asText(),
+                        node.path("marker").asText(),
+                        node.path("topK").asInt(3),
+                        node.path("expectRaw").asText("hit"),
+                        node.path("maxFirstHitRankResolved").asInt(1)));
+            }
+            return rows;
+        }
+    }
+
+    /**
+     * Both forms of every row, searched the way the application searches: the configured floor, filtered to the
+     * document the row names. The floor is a parameter here because it is the thing a follow-up can fall under
+     * — measuring at 0.0 would hide the only failure this dataset is able to see.
+     */
+    public static List<FollowUpRow> measureFollowUps(VectorStore store, List<FollowUp> rows, double floor) {
+        List<FollowUpRow> measured = new ArrayList<>();
+        for (FollowUp row : rows) {
+            Predicate<Document> gold = gold(row.filename(), row.marker());
+            List<Document> raw = search(store, row.followUp(), row.filename(), row.topK(), floor);
+            List<Document> resolved = search(store, row.resolved(), row.filename(), row.topK(), floor);
+            measured.add(new FollowUpRow(row.id(),
+                    RetrievalMetrics.firstHitRank(raw, gold), goldScore(raw, gold),
+                    RetrievalMetrics.firstHitRank(resolved, gold), goldScore(resolved, gold),
+                    row.expectRaw(), row.maxFirstHitRankResolved()));
+        }
+        return measured;
+    }
+
+    public static List<String> gateFollowUps(List<FollowUpRow> rows) {
+        List<String> failures = new ArrayList<>();
+        for (FollowUpRow row : rows) {
+            if ("miss".equals(row.expectRaw())) {
+                if (row.rawRank() != 0) {
+                    failures.add(row.id() + " expected the unresolved follow-up to retrieve nothing at the"
+                            + " configured floor, but its gold chunk came back at rank " + row.rawRank());
+                }
+            } else if (row.rawRank() == 0) {
+                failures.add(row.id() + " expected the unresolved follow-up to still retrieve its gold chunk,"
+                        + " but nothing under the floor carried the marker");
+            }
+            if (row.resolvedRank() == 0) {
+                failures.add(row.id() + " resolved to text that retrieves nothing: " + row.id());
+            } else if (row.resolvedRank() > row.maxFirstHitRankResolved()) {
+                failures.add(row.id() + " regressed: resolved gold chunk at rank " + row.resolvedRank()
+                        + ", budget " + row.maxFirstHitRankResolved());
+            }
+            // The claim that survives on every row, including the ones that already rank 1 unresolved. A raw
+            // gold that the floor dropped has no cosine to compare against — finding it at all is the win, and
+            // resolvedRank above already proves it.
+            if (Double.isNaN(row.rawGold())) {
+                if (Double.isNaN(row.resolvedGold())) {
+                    failures.add(row.id() + " neither form retrieved its gold chunk under the floor");
+                }
+            } else if (Double.isNaN(row.resolvedGold()) || row.resolvedGold() < row.rawGold()) {
+                failures.add(row.id() + " resolution did not raise the margin above the floor: raw gold "
+                        + RetrievalMetrics.format(row.rawGold()) + " vs resolved gold "
+                        + (Double.isNaN(row.resolvedGold()) ? "dropped"
+                           : RetrievalMetrics.format(row.resolvedGold())));
+            }
+        }
+        return failures;
+    }
+
+    public static String followUpTable(String embedder, double floor, List<FollowUpRow> rows, List<String> failures) {
+        StringBuilder report = new StringBuilder("\n")
+                .append(embedder).append(" — ").append(rows.size()).append(" follow-ups, similarity floor ")
+                .append(RetrievalMetrics.format(floor)).append("\n");
+        for (FollowUpRow row : rows) {
+            report.append(String.format(java.util.Locale.ROOT,
+                    "%-28s raw rank %d (expects %s, gold %s)   resolved rank %d (budget %d, gold %s)%n",
+                    row.id(), row.rawRank(), row.expectRaw(), score(row.rawGold()),
+                    row.resolvedRank(), row.maxFirstHitRankResolved(), score(row.resolvedGold())));
+        }
+        if (!failures.isEmpty()) {
+            report.append("\nFailures:\n  - ").append(String.join("\n  - ", failures)).append("\n");
+        }
+        return report.toString();
+    }
+
+    private static String score(double value) {
+        return Double.isNaN(value) ? "dropped" : RetrievalMetrics.format(value);
+    }
+
+    private static double goldScore(List<Document> hits, Predicate<Document> gold) {
+        return hits.stream()
+                .filter(gold)
+                .map(Document::getScore)
+                .filter(java.util.Objects::nonNull)
+                .mapToDouble(Double::doubleValue)
+                .findFirst()
+                .orElse(Double.NaN);
+    }
+
+    /** One search, the way the application searches: a floor of 0 means "no floor at all". */
+    public static List<Document> search(VectorStore store, String query, String filename, int topK, double floor) {
+        SearchRequest.Builder builder = SearchRequest.builder().query(query).topK(topK);
+        builder = floor > 0 ? builder.similarityThreshold(floor) : builder.similarityThresholdAll();
+        if (filename != null) {
+            builder.filterExpression(new FilterExpressionBuilder().eq("filename", filename).build());
+        }
+        return store.similaritySearch(builder.build());
+    }
+
     private static List<Document> retrieve(VectorStore store, GoldenQuestion question) {
-        return store.similaritySearch(SearchRequest.builder()
-                .query(question.question())
-                .topK(question.topK())
-                .similarityThresholdAll()
-                .filterExpression(new FilterExpressionBuilder().eq("filename", question.filename()).build())
-                .build());
+        return search(store, question.question(), question.filename(), question.topK(), 0);
     }
 
     /** Everything indexed under one filename, which is how a gold total is counted without a store scan API. */

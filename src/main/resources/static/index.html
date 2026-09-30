@@ -191,13 +191,17 @@
     <section>
         <h2>RAG query</h2>
         <p class="note">Retrieval-augmented answer with the exact chunks the model was given, and their
-            cosine scores.</p>
+            cosine scores. With a conversation id, a follow-up like "and what about travel?" is resolved
+            against that history before it is searched — the note above the answer says what was searched.</p>
         <label for="ragQuestion">Question</label>
         <textarea id="ragQuestion">What is the PTO policy?</textarea>
         <label for="ragFile">Restrict to filename (optional)</label>
         <input id="ragFile" placeholder="company-policy.md">
+        <label for="ragConv">Conversation id (optional — enables follow-ups)</label>
+        <input id="ragConv" placeholder="rag-1">
         <button data-run="rag">Ask</button>
         <div class="status" hidden></div>
+        <p class="note resolved" hidden></p>
         <pre hidden></pre>
         <div class="cites"></div>
         <details hidden><summary>raw response</summary><pre class="raw"></pre></details>
@@ -321,6 +325,9 @@
                 status(section, 'HTTP ' + response.status + (id ? ' · requestId ' + id : '')
                     + ' · ' + (body && body.detail ? body.detail : 'see raw response'), 'bad');
             }
+            // Returned so a panel can render something the payload carries that show() has no way to know
+            // about; the shared renderer stays shared.
+            return body;
         } catch (err) {
             status(section, err.name + ': ' + err.message, 'bad');
         } finally {
@@ -360,16 +367,29 @@
             return call(s, '/api/ai/tools/' + mode + '?prompt=' + encodeURIComponent(prompt));
         },
         movie: (s) => call(s, '/api/ai/structured/movie?genre=' + encodeURIComponent(value('movieGenre'))),
-        rag: (s) => {
+        rag: async (s) => {
             // No topK: /rag/query reads app.rag.top-k, and a field here once promised a per-request override
             // the endpoint never had.
             const body = { question: value('ragQuestion') };
             if (value('ragFile')) body.filename = value('ragFile');
-            return call(s, '/api/ai/rag/query', {
+            // With an id, "and what about travel?" is resolved against that conversation before retrieval;
+            // without one, this is exactly the single-shot request it has always been.
+            if (value('ragConv')) body.conversationId = value('ragConv');
+            s.querySelector('.resolved').hidden = true;
+            const payload = await call(s, '/api/ai/rag/query', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(body)
             });
+            const note = s.querySelector('.resolved');
+            const searched = payload && payload.resolvedQuestion;
+            note.hidden = !searched;
+            if (searched) {
+                note.textContent = payload.followUpResolved
+                    ? 'searched: "' + payload.resolvedQuestion + '" — resolved from the conversation, +'
+                        + payload.rewriteTimeMs + ' ms'
+                    : 'searched your question as typed (' + payload.followUpOutcome + ')';
+            }
         },
         search: (s) => {
             const params = new URLSearchParams({ query: value('searchQuery'), topK: value('searchTopK') || '3' });

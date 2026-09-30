@@ -8,6 +8,7 @@ import org.springframework.ai.chat.memory.ChatMemory;
 import org.springframework.ai.chat.memory.ChatMemoryRepository;
 import org.springframework.ai.chat.memory.MessageWindowChatMemory;
 import org.springframework.ai.embedding.EmbeddingModel;
+import org.springframework.ai.openai.OpenAiChatOptions;
 import org.springframework.ai.vectorstore.SimpleVectorStore;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.context.annotation.Bean;
@@ -58,6 +59,28 @@ public class AiConfig {
         return builder
                 .defaultSystem(SYSTEM_PROMPT)
                 .defaultAdvisors(MessageChatMemoryAdvisor.builder(chatMemory).build())
+                .build();
+    }
+
+    /**
+     * Rewrites a follow-up into a standalone question, so retrieval gets the antecedent instead of the pronoun.
+     *
+     * <p>A separate bean rather than a second client built inside {@code RagController}: {@code ChatClient.Builder}
+     * is prototype-scoped but {@code defaultAdvisors} <em>accumulates</em>, so a client built from the same builder
+     * the RAG controller already used would inherit {@code QuestionAnswerAdvisor} and answer the rewrite prompt
+     * with retrieved policy text. Here the only advisor is the one every builder gets from
+     * {@link #tokenUsageAdvisorCustomizer()}, which is what makes the second model call visible in
+     * {@code TOKEN_USAGE}.
+     *
+     * <p>Temperature 0 and 64 tokens because this is a transformation, not a composition — the measured failure
+     * mode of {@code qwen2.5:0.5b-instruct} on this prompt is an over-long creative answer, not a wrong one.
+     */
+    @Bean
+    @Qualifier("ragQueryRewriter")
+    public ChatClient ragQueryRewriter(ChatClient.Builder builder) {
+        return builder
+                .defaultSystem("You rewrite one question. Answer with the rewritten question only.")
+                .defaultOptions(OpenAiChatOptions.builder().temperature(0.0).maxTokens(64).build())
                 .build();
     }
 

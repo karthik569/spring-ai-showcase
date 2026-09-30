@@ -8,6 +8,7 @@ import com.example.springai.dto.MovieRecommendation;
 import com.example.springai.error.GlobalExceptionHandler;
 import com.example.springai.rag.StubEmbeddingModel;
 import com.example.springai.service.RagDocumentIngestionService;
+import com.example.springai.service.RagQueryResolver;
 import com.example.springai.service.RagStorePersistence;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -20,6 +21,8 @@ import org.springframework.ai.chat.memory.ChatMemory;
 import org.springframework.ai.chat.memory.InMemoryChatMemoryRepository;
 import org.springframework.ai.chat.memory.MessageWindowChatMemory;
 import org.springframework.ai.chat.messages.AssistantMessage;
+import org.springframework.ai.chat.messages.Message;
+import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.ai.chat.model.Generation;
 import org.springframework.ai.document.Document;
@@ -33,6 +36,7 @@ import java.lang.reflect.Proxy;
 import java.util.List;
 import java.util.Map;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
 
@@ -114,24 +118,95 @@ class ControllerIntegrationTest {
                 QuestionAnswerAdvisor.RETRIEVED_DOCUMENTS, List.of(chunk)));
         SimpleVectorStore vectorStore = stubbedVectorStore();
 
+        // Resolution on, exactly as shipped, but with no conversation id: the request must behave as it did
+        // before the field existed, and say why. The rewriter is a distinct client that must never be called.
         RagController controller = new RagController(createFakeBuilder(fakeChatClient), vectorStore,
-                ingestionService(vectorStore), 4, 0.2);
+                ingestionService(vectorStore),
+                new RagQueryResolver(createFakeChatClient("never searched"), inMemoryChatMemory(),
+                        true, 2, 300, false), 4, 0.2);
         MockMvc mockMvc = MockMvcBuilders.standaloneSetup(controller).build();
 
+        // No conversation id: resolution must be invisible, which is what "identical to before the field
+        // existed" means — including resolvedQuestion, which is the caller's own text.
         mockMvc.perform(post("/api/ai/rag/query")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"question\":\"How many leave days?\"}"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.answer").value("You get 25 days."))
+                .andExpect(jsonPath("$.resolvedQuestion").value("How many leave days?"))
+                .andExpect(jsonPath("$.followUpResolved").value(false))
+                .andExpect(jsonPath("$.followUpOutcome").value("NO_CONVERSATION"))
                 .andExpect(jsonPath("$.sourceDocuments[0].filename").value("policy.md"))
                 .andExpect(jsonPath("$.sourceDocuments[0].score").value(0.42));
+    }
+
+    /**
+     * The wiring around a follow-up: resolve first, search the resolved text, keep the citations the advisor
+     * produced, and write the turn back. The rewrite itself is a fixture here — {@code RagQueryResolverTest}
+     * owns the model-output rules and {@code FollowUpRetrievalTest} owns what the resolved text retrieves.
+     */
+    @Test
+    void testRagQueryResolvesAFollowUpAndRemembersTheTurn() throws Exception {
+        String standalone = "What is the reimbursement window for the home office equipment stipend?";
+        Document chunk = Document.builder()
+                .id("chunk-1")
+                .text("Reimbursements must be submitted within 30 days of purchase.")
+                .metadata(Map.of("filename", "company-policy.md"))
+                .score(0.588)
+                .build();
+        ChatClient answeringClient = createFakeChatClient("Within 30 days.", Map.of(
+                QuestionAnswerAdvisor.RETRIEVED_DOCUMENTS, List.of(chunk)));
+        ChatClient rewriter = createFakeChatClient(standalone);
+        ChatMemory memory = inMemoryChatMemory();
+        memory.add("rag-1", List.of(new UserMessage("What is the equipment stipend?"),
+                new AssistantMessage("1500 dollars a year.")));
+
+        SimpleVectorStore vectorStore = stubbedVectorStore();
+        RagController controller = new RagController(createFakeBuilder(answeringClient), vectorStore,
+                ingestionService(vectorStore), new RagQueryResolver(rewriter, memory, true, 2, 300, false), 4, 0.2);
+        MockMvc mockMvc = MockMvcBuilders.standaloneSetup(controller).build();
+
+        mockMvc.perform(post("/api/ai/rag/query")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"question\":\"how long do I have to submit that?\",\"conversationId\":\"rag-1\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.question").value("how long do I have to submit that?"))
+                .andExpect(jsonPath("$.resolvedQuestion").value(standalone))
+                .andExpect(jsonPath("$.followUpResolved").value(true))
+                .andExpect(jsonPath("$.followUpOutcome").value("REWRITTEN"))
+                .andExpect(jsonPath("$.answer").value("Within 30 days."))
+                .andExpect(jsonPath("$.sourceDocuments[0].score").value(0.588));
+
+        // The raw question is what gets stored, so GET /chat/memory/history keeps meaning "what the user
+        // typed" rather than what the rewrite decided to search for.
+        List<Message> stored = memory.get("rag-1");
+        assertEquals(4, stored.size());
+        assertEquals("how long do I have to submit that?", stored.get(2).getText());
+        assertEquals("Within 30 days.", stored.get(3).getText());
+    }
+
+    @Test
+    void testRagQueryRejectsAConversationIdLongerThanTheSchemaColumn() throws Exception {
+        SimpleVectorStore vectorStore = stubbedVectorStore();
+        RagController controller = new RagController(createFakeBuilder(createFakeChatClient("x", Map.of())),
+                vectorStore, ingestionService(vectorStore), resolverOff(), 4, 0.2);
+        MockMvc mockMvc = MockMvcBuilders.standaloneSetup(controller)
+                .setControllerAdvice(new GlobalExceptionHandler())
+                .build();
+
+        mockMvc.perform(post("/api/ai/rag/query")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"question\":\"How many leave days?\","
+                                + "\"conversationId\":\"this-conversation-identifier-is-definitely-longer-than-thirty-six-characters\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("invalid_request"));
     }
 
     @Test
     void testRagQueryRejectsABlankQuestion() throws Exception {
         SimpleVectorStore vectorStore = stubbedVectorStore();
         RagController controller = new RagController(createFakeBuilder(createFakeChatClient("x", Map.of())),
-                vectorStore, ingestionService(vectorStore), 4, 0.2);
+                vectorStore, ingestionService(vectorStore), resolverOff(), 4, 0.2);
         MockMvc mockMvc = MockMvcBuilders.standaloneSetup(controller)
                 .setControllerAdvice(new GlobalExceptionHandler())
                 .build();
@@ -148,7 +223,7 @@ class ControllerIntegrationTest {
     void testRagUploadRejectsAFileNameThatCouldBreakAFilterExpression() throws Exception {
         SimpleVectorStore vectorStore = stubbedVectorStore();
         RagController controller = new RagController(createFakeBuilder(createFakeChatClient("x", Map.of())),
-                vectorStore, ingestionService(vectorStore), 4, 0.2);
+                vectorStore, ingestionService(vectorStore), resolverOff(), 4, 0.2);
         MockMvc mockMvc = MockMvcBuilders.standaloneSetup(controller)
                 .setControllerAdvice(new GlobalExceptionHandler())
                 .build();
@@ -165,7 +240,7 @@ class ControllerIntegrationTest {
     void testRagUploadIndexesAPlaintextDocument() throws Exception {
         SimpleVectorStore vectorStore = stubbedVectorStore();
         RagController controller = new RagController(createFakeBuilder(createFakeChatClient("x", Map.of())),
-                vectorStore, ingestionService(vectorStore), 4, 0.2);
+                vectorStore, ingestionService(vectorStore), resolverOff(), 4, 0.2);
         MockMvc mockMvc = MockMvcBuilders.standaloneSetup(controller).build();
 
         MockMultipartFile document = new MockMultipartFile("file", "runbook.md", "text/markdown",
@@ -183,6 +258,11 @@ class ControllerIntegrationTest {
                 .chatMemoryRepository(new InMemoryChatMemoryRepository())
                 .maxMessages(6)
                 .build();
+    }
+
+    // Resolution off: a test that is about the endpoint's own contract should not depend on a rewrite client.
+    private static RagQueryResolver resolverOff() {
+        return new RagQueryResolver(createFakeChatClient("unused"), inMemoryChatMemory(), false, 2, 300, false);
     }
 
     private static ChatClient createFakeChatClient(Object responsePayload) {

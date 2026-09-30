@@ -112,9 +112,10 @@ runs. `TokenUsageAdvisor` uses `LOWEST_PRECEDENCE - 1` for that reason — see
 | **Fluent `ChatClient`** | [`ChatController.java`](src/main/java/com/example/springai/controller/ChatController.java) | System/user roles, `{param}` templating, `Flux<String>` SSE streaming. |
 | **Persisted multi-turn memory** | [`AiConfig.java`](src/main/java/com/example/springai/config/AiConfig.java) | `MessageWindowChatMemory` (6 messages) over the auto-configured JDBC repository and an H2 file database, so transcripts survive a restart. `/chat/memory/history` reads back exactly what the advisor will inject. |
 | **Token accounting** | [`TokenUsageAdvisor.java`](src/main/java/com/example/springai/advisor/TokenUsageAdvisor.java) | Registered with a `ChatClientCustomizer` so *every* client logs prompt/completion/total to the `TOKEN_USAGE` logger; Spring AI also publishes `gen_ai.client.token.usage` to the metrics endpoint. |
-| **RAG + upload + filters + scores** | [`RagController.java`](src/main/java/com/example/springai/controller/RagController.java) | `QuestionAnswerAdvisor` for grounded answers, `POST /rag/documents` for multipart indexing, a `filename` metadata filter, and `GET /rag/search` that surfaces each chunk's cosine score and explains zero matches. |
+| **RAG + upload + filters + scores** | [`RagController.java`](src/main/java/com/example/springai/controller/RagController.java) | `QuestionAnswerAdvisor` for grounded answers, `POST /rag/documents` for multipart indexing, a `filename` metadata filter, and `GET /rag/search` that surfaces each chunk's cosine score and explains zero matches. Every response reports `resolvedQuestion`, so the citations can be read against the text that was actually searched. |
+| **Follow-ups resolved before retrieval** | [`RagQueryResolver.java`](src/main/java/com/example/springai/service/RagQueryResolver.java) | A `conversationId` on `/rag/query` buys one cheap model call that rewrites "how long do I have to submit that?" into text an embedder can answer, reading persisted chat memory directly — the retrieval advisor builds its query from the user message and cannot see injected history. Validation decides, not the model's own confidence. |
 | **Knowledge base that survives a restart** | [`RagStorePersistence.java`](src/main/java/com/example/springai/service/RagStorePersistence.java) | `SimpleVectorStore.save`/`load` over two files in `./data/rag`, plus a per-filename SHA-256 manifest so an unchanged shipped document is not re-embedded and a truncated snapshot is discarded loudly instead of silently empty. |
-| **Offline retrieval eval** | [`GoldenQuestionsTest.java`](src/test/java/com/example/springai/rag/GoldenQuestionsTest.java), [`LiveRetrievalComparisonTest.java`](src/test/java/com/example/springai/rag/LiveRetrievalComparisonTest.java) | 15 golden questions with verbatim answer markers, rank-based metrics, and a stub embedder that makes the real cosine/filter/threshold code assertable with Ollama switched off. |
+| **Offline retrieval eval** | [`GoldenQuestionsTest.java`](src/test/java/com/example/springai/rag/GoldenQuestionsTest.java), [`FollowUpRetrievalTest.java`](src/test/java/com/example/springai/rag/FollowUpRetrievalTest.java), [`LiveRetrievalComparisonTest.java`](src/test/java/com/example/springai/rag/LiveRetrievalComparisonTest.java) | 15 golden questions with verbatim answer markers plus 3 follow-up rows, rank-based metrics, and a stub embedder that makes the real cosine/filter/threshold code assertable with Ollama switched off. |
 | **Tool / Function calling** | [`ToolCallingController.java`](src/main/java/com/example/springai/controller/ToolCallingController.java) | `Function<Request, Response>` beans described with `@Description` ([`WeatherToolService`](src/main/java/com/example/springai/service/WeatherToolService.java), [`OrderToolService`](src/main/java/com/example/springai/service/OrderToolService.java)), bound per call with `.toolNames(...)`; the model decides whether to invoke them. |
 | **Structured output** | [`StructuredOutputController.java`](src/main/java/com/example/springai/controller/StructuredOutputController.java) | `responseEntity(...)` parses into the record and keeps the raw completion; a flat answer shape is restated after the schema, an incomplete record retries once, then `422` with `rawModelOutput`. |
 | **Multimodal vision** | [`MultimodalController.java`](src/main/java/com/example/springai/controller/MultimodalController.java) | Server-side download with a `User-Agent`, address-class screening, `Media` attachment on the prompt. |
@@ -164,7 +165,10 @@ upload and image analysis.
 
 Every result panel shows the answer, the raw JSON body, and the status line `HTTP <code> · requestId <X-Request-Id>`,
 so a failure can be taken straight to `grep <requestId> logs/app.log`. Streaming uses `EventSource`, which is the
-same request path `curl -N` takes; the panel re-renders as chunks arrive rather than at the end.
+same request path `curl -N` takes, so both hit the same concurrency ceiling. The RAG panel has an optional
+conversation id; when a follow-up was resolved it also prints a one-line note naming the text that was searched
+and the milliseconds the rewrite cost, because a citation list without that line invites the reader to assume the
+question they typed is the question that was asked of the vector store.
 
 ---
 
@@ -290,10 +294,12 @@ verbatim — this is a real response from `?genre=Cyberpunk`, so note that **the
 ```
 
 ### 6. Retrieval-Augmented Generation
-`POST /api/ai/rag/query` — body `{ "question": "...", "filename": "..." }`, where `filename` is an optional
-metadata filter. How many chunks get injected is `app.rag.top-k`; it is **not** a per-request field, and an
-earlier revision of this record carried a `topK` that the controller never read. That field has been deleted
-rather than wired up, so the published request schema now matches the behaviour.
+`POST /api/ai/rag/query` — body `{ "question": "...", "filename": "...", "conversationId": "..." }`, where
+`filename` is an optional metadata filter and `conversationId` is an optional id that turns the endpoint from
+single-shot into a two-turn exchange (see *Follow-up questions* below). How many chunks get injected is
+`app.rag.top-k`; it is **not** a per-request field, and an earlier revision of this record carried a `topK` that
+the controller never read. That field has been deleted rather than wired up, so the published request schema now
+matches the behaviour.
 
 ```bash
 curl -X POST http://localhost:8080/api/ai/rag/query \
@@ -302,6 +308,10 @@ curl -X POST http://localhost:8080/api/ai/rag/query \
 ```
 ```json
 { "question": "How much home office equipment stipend do employees get?",
+  "resolvedQuestion": "How much home office equipment stipend do employees get?",
+  "followUpResolved": false,
+  "followUpOutcome": "NO_CONVERSATION",
+  "rewriteTimeMs": 0,
   "answer": "Sorry, but I don't have any specific details about home office equipment stipends for employees in this particular context. …",
   "sourceDocuments": [
     { "filename": "company-policy.md", "score": 0.5937717910868997,
@@ -326,6 +336,53 @@ rejected. Scores are not bit-stable with a local embedder: the same query can re
 on the next, so treat the third decimal as noise. **`answer` is not reproducible either** — the refusal above is
 one sample of it; the next run of the same request names the $1,500 correctly. Trust `sourceDocuments`, not the
 prose.
+
+#### Follow-up questions, resolved before retrieval
+Give the same request a `conversationId` and a second question can refer to the first:
+
+```bash
+curl -X POST http://localhost:8080/api/ai/rag/query -H "Content-Type: application/json" \
+     -d '{"question":"What is the home office equipment stipend?","conversationId":"rag-floor-2"}'
+curl -X POST http://localhost:8080/api/ai/rag/query -H "Content-Type: application/json" \
+     -d '{"question":"how long do I have to submit that?","conversationId":"rag-floor-2"}'
+```
+```json
+{ "question": "how long do I have to submit that?",
+  "resolvedQuestion": "How long do you have to submit the home office equipment stipend?",
+  "followUpResolved": true, "followUpOutcome": "REWRITTEN", "rewriteTimeMs": 325,
+  "sourceDocuments": [ { "filename": "company-policy.md", "score": 0.47254126773022515, "excerpt": "..." } ] }
+```
+
+`resolvedQuestion` is the text that actually went into the vector search, and it is present on **every**
+response — also when nothing was rewritten — because a citation list is only honest if the reader can see what
+was searched. The same follow-up unresolved retrieved a chunk at 0.2185 that does **not** contain the answer
+("within 30 days of purchase"); resolved, the chunk that does contain it came back at 0.4725. `GET /rag/search`
+still takes the raw text, on purpose: it is the instrument that shows what an unresolved query does.
+
+What that costs, measured on `qwen2.5:0.5b-instruct`: one extra model call of 325–595 ms and ~126–148 tokens,
+against a `/rag/query` baseline of 1.1–2.1 s — call it +20–60 % on a turn that resolved. It is visible rather
+than hidden: `rewriteTimeMs` in the response, a `[RAG-REWRITE]` line, and a second `TOKEN_USAGE` line per
+request in `logs/app.log`.
+
+`followUpOutcome` says why there was or wasn't a rewrite, so a silent fallback is impossible:
+`DISABLED` (`app.rag.follow-up.enabled=false`), `NO_CONVERSATION` (no usable id), `EMPTY_MEMORY` (first turn),
+`SKIPPED_BY_TRIGGER` (configured to need a pronoun, and this question has none), `PASSTHROUGH` (the model
+declined, echoed, or produced text that failed validation), `REWRITTEN`. A model that is unreachable during the
+rewrite is **not** a fallback: the request fails as `503 llm_backend_unreachable` like any other backend
+failure, rather than quietly answering the pronoun.
+
+RAG turns are written back into the same chat memory as `POST /api/ai/chat/memory`, so
+`GET /api/ai/chat/memory/history?conversationId=rag-floor-2` shows them — the raw question, not the resolved
+one. Two consequences worth knowing: **the six-message window is shared**, so one RAG exchange displaces two
+chat messages, and the RAG *answer* is stored even when it was ungrounded, because the next "what's the budget
+for that?" refers to the assistant's own prose.
+
+`app.rag.follow-up.enabled` / `.max-history-turns` / `.max-query-chars` / `.require-trigger` (env:
+`RAG_FOLLOW_UP_ENABLED`, `RAG_FOLLOW_UP_REQUIRE_TRIGGER`) configure it; `require-trigger=false` is the default
+because a missed rewrite is invisible while a slow one is not. Why this is a service and not an advisor — the
+bytecode that proves `MessageChatMemoryAdvisor` cannot help retrieval — is in
+[`ARCHITECTURE_AND_METHODS.md`](ARCHITECTURE_AND_METHODS.md), and the rank-by-rank measurement that
+decided whether to build it at all is in [`docs/SESSION-HANDOFF.md`](docs/SESSION-HANDOFF.md).
 
 #### Raw vector similarity search
 `GET /api/ai/rag/search?query=...&topK=...&filename=...`
@@ -429,12 +486,13 @@ Pick the URL yourself — the endpoint takes no default asset. Requirements, lea
 ## 🛠 Build, test, package
 
 ```bash
-mvn -B test              # 32 tests — 31 run offline, 1 skipped, no model calls: standalone MockMvc +
+mvn -B test              # 59 tests — 57 run offline, 2 skipped, no model calls: standalone MockMvc +
                          # proxy-faked ChatClient, a stub embedder for the RAG store, @TempDir for the
                          # persistence tests
-mvn -B test -Dapp.rag.eval=true   # runs the skipped one too: the golden questions re-measured against the live
-                                  # all-minilm. Opt-in because it boots the context and needs Ollama; without
-                                  # the property the class is skipped, which is green, and no build file changes
+mvn -B test -Dapp.rag.eval=true   # runs the skipped ones too: the golden questions and the follow-ups
+                                  # re-measured against the live all-minilm. Opt-in because it boots the
+                                  # context and needs Ollama; without the property the class is skipped, which
+                                  # is green, and no build file changes
 mvn clean package -DskipTests
 java -jar target/spring-ai-showcase-1.0.0-SNAPSHOT.jar
 ```
@@ -451,6 +509,16 @@ finding worth carrying into any retrieval change here: an unanswerable question 
 (`pii-prohibition` 0.345, `failover-from-runbook` 0.299, `acronym-pii` 0.158), so **a cosine floor cannot tell an
 answerable question from an unanswerable one** — and `acronym-pii` ranks first at 0.158, under the app's 0.2
 floor, which is the same chunk both correctly retrieved and correctly dropped.
+
+A second dataset, [`src/test/resources/rag/follow-up-questions.json`](src/test/resources/rag/follow-up-questions.json),
+pairs each raw follow-up with the antecedent turn and the resolved text. It is the one place the eval **does**
+apply the configured floor, on purpose: a follow-up's failure mode is its gold chunk scoring 0.166 and being
+dropped, which a threshold-free search cannot see. It lives in its own file rather than as extra rows in
+`golden-questions.json` because a follow-up has to be able to expect a *miss* (`"expectRaw": "miss"`), and the
+15 shipped rows have rank budgets calibrated by running them. Tier 1 asserts it against the stub — where
+`how long do I have to submit that?` retrieves **nothing** at the floor and the resolved form retrieves its gold
+chunk at 0.248 — and tier 2 prints the same rows on live vectors without gating them: unresolved rank 0 (gold
+dropped) versus resolved rank 1 at 0.604, while the other two rows already rank 1 both ways.
 
 Tier 2 talks to the real backend, so it needs the same environment as the app
 (`OPENAI_BASE_URL=http://localhost:11434`, `OPENAI_EMBEDDING_MODEL=all-minilm`, …). Without it the class reports
