@@ -3,6 +3,8 @@ package com.example.springai.controller;
 import com.example.springai.dto.RagQueryRequest;
 import com.example.springai.dto.RagQueryResponse;
 import com.example.springai.dto.RetrievedChunk;
+import com.example.springai.guardrail.PiiRedactor;
+import com.example.springai.guardrail.PromptInjectionDetector;
 import com.example.springai.service.RagDocumentIngestionService;
 import com.example.springai.service.RagQueryResolver;
 import jakarta.validation.Valid;
@@ -22,6 +24,8 @@ import org.springframework.web.multipart.MultipartFile;
 import org.springframework.web.server.ResponseStatusException;
 import org.springframework.ai.vectorstore.filter.FilterExpressionBuilder;
 
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -45,17 +49,26 @@ public class RagController {
     private final VectorStore vectorStore;
     private final RagDocumentIngestionService ingestionService;
     private final RagQueryResolver queryResolver;
+    private final PiiRedactor piiRedactor;
+    private final PromptInjectionDetector injectionDetector;
+    private final boolean blockInjectionOnIngest;
     private final int defaultTopK;
 
     public RagController(ChatClient.Builder chatClientBuilder,
                          VectorStore vectorStore,
                          RagDocumentIngestionService ingestionService,
                          RagQueryResolver queryResolver,
+                         PiiRedactor piiRedactor,
+                         PromptInjectionDetector injectionDetector,
+                         @Value("${app.guardrails.block-injection-on-ingest:true}") boolean blockInjectionOnIngest,
                          @Value("${app.rag.top-k:4}") int defaultTopK,
                          @Value("${app.rag.similarity-threshold:0.5}") double similarityThreshold) {
         this.vectorStore = vectorStore;
         this.ingestionService = ingestionService;
         this.queryResolver = queryResolver;
+        this.piiRedactor = piiRedactor;
+        this.injectionDetector = injectionDetector;
+        this.blockInjectionOnIngest = blockInjectionOnIngest;
         this.defaultTopK = defaultTopK;
         this.chatClient = chatClientBuilder
                 .defaultAdvisors(QuestionAnswerAdvisor.builder(vectorStore)
@@ -86,13 +99,18 @@ public class RagController {
                 .chatClientResponse();
 
         String answer = answerTextOf(response);
-        // Reported from the advisor's own retrieval, so the citations are literally the text the model was
-        // given — a second search with different settings could advertise chunks that never reached the prompt.
+        // The advice is the exact text the model was given — a second search with different settings could
+        // advertise chunks that never reached the prompt.
         List<RetrievedChunk> sources = chunksOf(response.context().get(QuestionAnswerAdvisor.RETRIEVED_DOCUMENTS));
-        queryResolver.remember(request.conversationId(), request.question(), answer);
+        List<String> pii = piiRedactor.findings(answer);
+        String safeAnswer = piiRedactor.redact(answer);
+        if (!pii.isEmpty()) {
+            log.warn("[GUARDRAIL] redacted {} from a RAG answer for question={}", pii, request.question());
+        }
+        queryResolver.remember(request.conversationId(), request.question(), safeAnswer);
 
         return new RagQueryResponse(request.question(), resolution.retrievalQuery(), resolution.followUpResolved(),
-                resolution.outcome().name(), resolution.rewriteTimeMs(), answer, sources,
+                resolution.outcome().name(), resolution.rewriteTimeMs(), safeAnswer, sources,
                 System.currentTimeMillis() - start);
     }
 
@@ -163,6 +181,23 @@ public class RagController {
         String filename = requireSafeFilename(hasText(file.getOriginalFilename())
                 ? file.getOriginalFilename()
                 : "upload-" + System.currentTimeMillis() + ".txt");
+
+        // Screened before it can be indexed: a retrieved chunk is injected as context, so an uploaded
+        // "ignore your instructions" line is an indirect prompt injection aimed at every later answer.
+        String content;
+        try {
+            content = new String(file.getBytes(), StandardCharsets.UTF_8);
+        } catch (IOException ex) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "document could not be read: " + ex.getMessage());
+        }
+        List<String> injection = injectionDetector.scan(content);
+        if (!injection.isEmpty()) {
+            log.warn("[GUARDRAIL] rejected upload {} for injection patterns {}", filename, injection);
+            if (blockInjectionOnIngest) {
+                throw new ResponseStatusException(HttpStatus.UNPROCESSABLE_ENTITY,
+                        "document rejected: it matches prompt-injection rules " + injection);
+            }
+        }
 
         ingestionService.evict(filename);
         int chunks = ingestionService.ingest(file.getResource(), filename, "upload");

@@ -1,5 +1,6 @@
 package com.example.springai.controller;
 
+import com.example.springai.guardrail.PiiRedactor;
 import com.example.springai.support.ConversationIds;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.memory.ChatMemory;
@@ -20,13 +21,16 @@ public class ChatController {
     private final ChatClient chatClient;
     private final ChatClient conversationalChatClient;
     private final ChatMemory chatMemory;
+    private final PiiRedactor piiRedactor;
 
     public ChatController(ChatClient chatClient,
                           @Qualifier("conversationalChatClient") ChatClient conversationalChatClient,
-                          ChatMemory chatMemory) {
+                          ChatMemory chatMemory,
+                          PiiRedactor piiRedactor) {
         this.chatClient = chatClient;
         this.conversationalChatClient = conversationalChatClient;
         this.chatMemory = chatMemory;
+        this.piiRedactor = piiRedactor;
     }
 
     @GetMapping
@@ -35,7 +39,7 @@ public class ChatController {
                 .user(message)
                 .call()
                 .content();
-        return Map.of("prompt", message, "response", response != null ? response : "");
+        return Map.of("prompt", message, "response", response != null ? piiRedactor.redact(response) : "");
     }
 
     @GetMapping("/template")
@@ -62,7 +66,8 @@ public class ChatController {
                 .user(message)
                 .advisors(a -> a.param(ChatMemory.CONVERSATION_ID, conversation))
                 .stream()
-                .content();
+                .content()
+                .map(piiRedactor::redact);
     }
 
     // The conversation id is mandatory: the memory advisor throws without it, and it is what keeps two
@@ -82,7 +87,7 @@ public class ChatController {
         return Map.of(
                 "conversationId", conversation,
                 "message", message,
-                "response", response != null ? response : ""
+                "response", response != null ? piiRedactor.redact(response) : ""
         );
     }
 

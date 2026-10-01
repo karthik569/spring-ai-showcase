@@ -1,10 +1,16 @@
 package com.example.springai.controller;
 
+import com.example.springai.guardrail.PiiRedactor;
+import com.example.springai.support.ConversationIds;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.chat.memory.ChatMemory;
 import org.springframework.ai.openai.OpenAiChatOptions;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.*;
+import reactor.core.publisher.Flux;
 
 import java.util.Map;
 
@@ -21,10 +27,20 @@ public class ToolCallingController {
             .temperature(0.2)
             .build();
 
-    private final ChatClient chatClient;
+    private static final String[] ALL_TOOLS = {
+            "getCurrentWeather", "getOrderStatus", "calculate", "getCurrentDateTime", "searchKnowledgeBase"
+    };
 
-    public ToolCallingController(ChatClient chatClient) {
+    private final ChatClient chatClient;
+    private final ChatClient conversationalChatClient;
+    private final PiiRedactor piiRedactor;
+
+    public ToolCallingController(ChatClient chatClient,
+                                 @Qualifier("conversationalChatClient") ChatClient conversationalChatClient,
+                                 PiiRedactor piiRedactor) {
         this.chatClient = chatClient;
+        this.conversationalChatClient = conversationalChatClient;
+        this.piiRedactor = piiRedactor;
     }
 
     @GetMapping("/weather")
@@ -87,27 +103,68 @@ public class ToolCallingController {
         return answered(prompt, answer);
     }
 
-    // The agentic endpoint: the full toolbox is offered and the model chains whichever tools the question
-    // needs — arithmetic, the clock, the order system and the knowledge base in a single turn.
+    /**
+     * The agentic endpoint: the full toolbox is offered and the model chains whichever tools the question
+     * needs — arithmetic, the clock, the order system and the knowledge base in a single turn.
+     *
+     * <p>Without a conversation id it is stateless, exactly as before. With one, the turn is stored and the
+     * next turn can say "and times three?" — the same memory advisor the chat endpoints use, with the tools
+     * still in play.
+     */
     @GetMapping("/assistant")
     public Map<String, String> assistant(
-            @RequestParam(defaultValue = "How many days of annual leave do I get, and what is 3 times that number?") String prompt) {
-        String answer = chatClient.prompt()
+            @RequestParam(defaultValue = "How many days of annual leave do I get, and what is 3 times that number?") String prompt,
+            @RequestParam(required = false) String conversationId) {
+
+        final String conversation = conversationId != null && !conversationId.isBlank()
+                ? ConversationIds.requireNonBlank(conversationId)
+                : null;
+        ChatClient client = conversation == null ? chatClient : conversationalChatClient;
+
+        String answer = client.prompt()
                 .user(prompt)
-                .toolNames("getCurrentWeather", "getOrderStatus", "calculate", "getCurrentDateTime",
-                        "searchKnowledgeBase")
+                .toolNames(ALL_TOOLS)
                 .options(LOW_TEMPERATURE)
+                .advisors(advisors -> {
+                    if (conversation != null) {
+                        advisors.param(ChatMemory.CONVERSATION_ID, conversation);
+                    }
+                })
                 .call()
                 .content();
 
-        return answered(prompt, answer);
+        Map<String, String> response = answered(prompt, answer);
+        return conversation == null ? response
+                : Map.of("conversationId", conversation, "prompt", prompt, "response", response.get("response"));
+    }
+
+    /**
+     * The same agentic call, streamed. Tool calls execute first and their results are folded into the prompt,
+     * so the first token a client sees already arrives after the tools ran; the stream is the model composing
+     * its answer, not the tool-calling round-trips.
+     */
+    @GetMapping(value = "/assistant/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public Flux<String> assistantStream(
+            @RequestParam(defaultValue = "How many days of annual leave do I get, and what is 3 times that number?") String prompt,
+            @RequestParam(defaultValue = "assistant-1") String conversationId) {
+
+        String conversation = ConversationIds.requireNonBlank(conversationId);
+        return conversationalChatClient.prompt()
+                .user(prompt)
+                .toolNames(ALL_TOOLS)
+                .options(LOW_TEMPERATURE)
+                .advisors(a -> a.param(ChatMemory.CONVERSATION_ID, conversation))
+                .stream()
+                .content()
+                .map(piiRedactor::redact);
     }
 
     // An empty answer would otherwise look like a successful call; the tool log shows whether one ran.
-    private static Map<String, String> answered(String prompt, String answer) {
+    // Every tool answer passes through redaction, so a tool result echoing personal data does not leave here.
+    private Map<String, String> answered(String prompt, String answer) {
         if (answer == null || answer.isBlank()) {
             log.warn("Model returned no completion for tool prompt: {}", prompt);
         }
-        return Map.of("prompt", prompt, "response", answer == null ? "" : answer);
+        return Map.of("prompt", prompt, "response", answer == null ? "" : piiRedactor.redact(answer));
     }
 }

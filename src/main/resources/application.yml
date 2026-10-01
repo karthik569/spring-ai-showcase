@@ -43,6 +43,8 @@ spring:
         options:
           # Needs a real embedding model (all-minilm, nomic-embed-text, text-embedding-3-small). A chat
           # model used as the vectorizer produces near-random cosine scores, so short queries match nothing.
+          # The vectorizer itself is built in AiConfig against app.embedding.base-url below; this value is
+          # what that bean is named, and what the auto-configured client would have used.
           model: ${OPENAI_EMBEDDING_MODEL:all-minilm}
 
 springdoc:
@@ -66,6 +68,16 @@ app:
   ai:
     # Ceiling on simultaneous model calls; extra requests get an immediate 503 rather than queueing unseen.
     max-concurrent-requests: 4
+  embedding:
+    # llama-server serves one model per process, so the vectorizer runs on its own port instead of
+    # sharing chat's. Started by start-offline-llm.sh (second llama-server on 8082).
+    base-url: ${OPENAI_EMBEDDING_BASE_URL:http://localhost:8082}
+    model: ${OPENAI_EMBEDDING_MODEL:all-minilm}
+  guardrails:
+    # Redact PII from model output before it leaves the API. Turn off to see raw completions while debugging.
+    redact-output: ${GUARDRAILS_REDACT_OUTPUT:true}
+    # Reject document uploads that look like prompt injection instead of indexing them.
+    block-injection-on-ingest: ${GUARDRAILS_BLOCK_INJECTION:true}
   health:
     llm:
       cache-ttl: 30s

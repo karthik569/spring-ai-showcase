@@ -7,12 +7,18 @@ import org.springframework.ai.chat.client.advisor.MessageChatMemoryAdvisor;
 import org.springframework.ai.chat.memory.ChatMemory;
 import org.springframework.ai.chat.memory.ChatMemoryRepository;
 import org.springframework.ai.chat.memory.MessageWindowChatMemory;
+import org.springframework.ai.document.MetadataMode;
 import org.springframework.ai.embedding.EmbeddingModel;
 import org.springframework.ai.openai.OpenAiChatOptions;
+import org.springframework.ai.openai.OpenAiEmbeddingModel;
+import org.springframework.ai.openai.OpenAiEmbeddingOptions;
+import org.springframework.ai.openai.api.OpenAiApi;
 import org.springframework.ai.vectorstore.SimpleVectorStore;
 import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Primary;
 
 @Configuration
 public class AiConfig {
@@ -82,6 +88,32 @@ public class AiConfig {
                 .defaultSystem("You rewrite one question. Answer with the rewritten question only.")
                 .defaultOptions(OpenAiChatOptions.builder().temperature(0.0).maxTokens(64).build())
                 .build();
+    }
+
+    /**
+     * The vectorizer is a dedicated model on its own endpoint, not the chat model. A chat model used for
+     * embeddings still returns vectors, so the misconfiguration is silent — it just ranks near-randomly.
+     * Pointing this at a separate {@code llama-server} is what lets chat and embedding models differ, which
+     * the single {@code spring.ai.openai.base-url} cannot express.
+     *
+     * <p>{@code @Primary} because the auto-configured {@code OpenAiEmbeddingModel} still exists and also
+     * implements {@link EmbeddingModel}; without it the {@link SimpleVectorStore} injection would be ambiguous.
+     */
+    @Bean
+    @Primary
+    public EmbeddingModel embeddingModel(
+            @Value("${app.embedding.base-url:http://localhost:8082}") String baseUrl,
+            @Value("${app.embedding.model:all-minilm}") String model,
+            @Value("${OPENAI_API_KEY:demo-api-key}") String apiKey) {
+
+        OpenAiApi api = OpenAiApi.builder()
+                .baseUrl(baseUrl)
+                .apiKey(apiKey)
+                .build();
+        OpenAiEmbeddingOptions options = OpenAiEmbeddingOptions.builder()
+                .model(model)
+                .build();
+        return new OpenAiEmbeddingModel(api, MetadataMode.EMBED, options);
     }
 
     /**

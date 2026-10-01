@@ -173,7 +173,12 @@
         </select>
         <label for="toolPrompt">Prompt</label>
         <textarea id="toolPrompt">What is the weather like in Tokyo right now?</textarea>
-        <button data-run="tools">Run</button>
+        <label for="toolConv">Conversation id (assistant only — optional, enables follow-ups)</label>
+        <input id="toolConv" placeholder="assistant-1">
+        <div class="row">
+            <button data-run="tools">Run</button>
+            <button data-run="toolsStream" disabled>Stream (assistant)</button>
+        </div>
         <div class="status" hidden></div>
         <pre hidden></pre>
         <details hidden><summary>raw response</summary><pre class="raw"></pre></details>
@@ -235,7 +240,7 @@
     <section>
         <h2>Index a document</h2>
         <p class="note">Plain-text upload, chunked and embedded. Re-uploading a name replaces its chunks.
-            Limit 1 MB per file.</p>
+            Documents matching prompt-injection rules are rejected with HTTP 422. Limit 1 MB per file.</p>
     <label for="docFile">File</label>
     <input id="docFile" type="file" accept=".txt,.md,.csv,.json,.log,text/plain">
         <button data-run="upload">Upload</button>
@@ -370,8 +375,12 @@
                 assistant: 'How many days of annual leave do I get, and what is 3 times that number?'
             };
             const prompt = document.getElementById('toolPrompt').value.trim() || prompts[mode];
-            return call(s, '/api/ai/tools/' + mode + '?prompt=' + encodeURIComponent(prompt));
+            // The conversation id only means anything to the assistant; the single-tool endpoints are stateless.
+            const conv = mode === 'assistant' ? value('toolConv') : '';
+            return call(s, '/api/ai/tools/' + mode + '?prompt=' + encodeURIComponent(prompt)
+                + (conv ? '&conversationId=' + encodeURIComponent(conv) : ''));
         },
+        toolsStream: (s) => startToolStream(s),
         movie: (s) => call(s, '/api/ai/structured/movie?genre=' + encodeURIComponent(value('movieGenre'))),
         rag: async (s) => {
             // No topK: /rag/query reads app.rag.top-k, and a field here once promised a per-request override
@@ -417,6 +426,41 @@
         stream: (s) => startStream(s),
         streamStop: () => stopStream()
     };
+
+    // Streaming is only wired for the assistant mode; the others are single-shot tool calls.
+    function startToolStream(section) {
+        if (value('toolMode') !== 'assistant') {
+            status(section, 'streaming is only available for the assistant mode', 'bad');
+            return;
+        }
+        stopStream();
+        const out = section.querySelector('pre:not([class])');
+        out.hidden = false;
+        out.textContent = '';
+        section.querySelectorAll('button').forEach((b) => { b.disabled = b.dataset.run !== 'toolsStream'; });
+        status(section, 'streaming (tools run first, then tokens arrive) …');
+
+        const prompt = document.getElementById('toolPrompt').value.trim()
+            || 'How many days of annual leave do I get, and what is 3 times that number?';
+        const url = '/api/ai/tools/assistant/stream?prompt=' + encodeURIComponent(prompt)
+            + '&conversationId=' + encodeURIComponent(value('toolConv') || 'assistant-1');
+        const source = new EventSource(url);
+        state.source = source;
+        let tokens = 0;
+
+        source.onmessage = (event) => {
+            out.textContent += event.data === '' ? '\n' : event.data;
+            out.scrollTop = out.scrollHeight;
+            tokens++;
+            status(section, 'streaming … ' + tokens + ' chunks', 'ok');
+        };
+        source.onerror = () => {
+            source.close();
+            state.source = null;
+            section.querySelectorAll('button').forEach((b) => { b.disabled = false; });
+            status(section, 'closed after ' + tokens + ' chunks', 'ok');
+        };
+    }
 
     function startStream(section) {
         stopStream();
@@ -495,6 +539,14 @@
             if (action) action(panelOf(button));
         });
     });
+
+    // The stream button only makes sense for the assistant mode; keep it in step with the selector.
+    const toolMode = document.getElementById('toolMode');
+    const syncToolStream = () => {
+        document.querySelector('[data-run="toolsStream"]').disabled = toolMode.value !== 'assistant';
+    };
+    toolMode.addEventListener('change', syncToolStream);
+    syncToolStream();
 
     window.addEventListener('beforeunload', stopStream);
 </script>
