@@ -34,6 +34,10 @@ Two models, not one, is not a quirk of this repo: text generation and embedding 
 vector search in §Step 3 is only as good as the embedder. (You *can* point `OPENAI_EMBEDDING_MODEL` at a chat
 model; the scores then become meaningless noise, which is a bad way to learn RAG.)
 
+> On Termux there is no Ollama: `start-offline-llm.sh` starts the two models itself — Qwen2.5-1.5B on 8081 and a
+> dedicated all-MiniLM embedder on 8082 — and `start-spring-ai.sh` exports the matching `OPENAI_*` variables.
+> Everything below still applies; only the endpoints differ (8081/8082 instead of 11434).
+
 ```bash
 export OPENAI_API_KEY="ollama"                   # any non-empty string; Ollama ignores the value
 export OPENAI_BASE_URL="http://localhost:11434"  # REQUIRED for Ollama — the built-in default is 8081, and no /v1 (the client appends it)
@@ -385,6 +389,7 @@ Code: [`StructuredOutputController`](../src/main/java/com/example/springai/contr
 8. [`GlobalExceptionHandler.java`](../src/main/java/com/example/springai/error/GlobalExceptionHandler.java) — what production error contracts look like for a model call.
 9. `src/test/java/…/ControllerIntegrationTest.java` — how to test controllers that call a model **without** calling a model.
 10. [`RagStorePersistenceTest.java`](../src/test/java/com/example/springai/service/RagStorePersistenceTest.java) and [`GoldenQuestionsTest.java`](../src/test/java/com/example/springai/rag/GoldenQuestionsTest.java) — the two offline patterns behind §Step 3: a restart simulated with `@TempDir`, and retrieval asserted by rank.
+11. The newer capabilities each live in their own package: `cache/`, `vectorstore/` (hybrid), `agent/`, `guardrail/`, `observability/` — read the one whose panel you are curious about.
 
 ---
 
@@ -415,6 +420,20 @@ right — citations, provenance, token counts, and a typed error instead of a st
 ---
 
 ## 6. Next
+
+The five steps above are the spine. Four more capabilities ship alongside them — each has a demo panel and a
+README section, and they are deliberately *not* required to understand the core:
+
+- **Semantic response cache** (`SemanticCacheAdvisor`) — a paraphrase of an already-answered question is
+  replayed without a model call; `app.cache.*`.
+- **Hybrid retrieval** (`HybridVectorStore`) — BM25 fused with the cosine ranking, so an acronym the embedder
+  cannot represent is still found; `RAG_HYBRID_ENABLED`.
+- **Agentic loop** (`GET /api/ai/tools/agent`) — the model chains tools across several rounds, and the response
+  carries the full step trace.
+- **Guardrails** — PII redaction on every answer, prompt-injection screening on uploads.
+
+Plus a `GET /api/ai/metrics/summary` roll-up (requests, tokens, cache hit rate, latency p50/p95) that the demo
+page renders as its eleventh panel. See [`README.md`](../README.md) §Capabilities.
 
 - [`README.md`](../README.md) — full endpoint reference, config table, resilience and operations.
 - [`ARCHITECTURE_AND_METHODS.md`](../ARCHITECTURE_AND_METHODS.md) — the advisor chain, ordering traps, and what changed between Spring AI milestones and 1.1.8.

@@ -4,8 +4,11 @@ A method-by-method read of `spring-ai-showcase`: what each class does, why it is
 behaviours were verified against the running system rather than taken from documentation.
 
 **Stack:** Java 21 · Spring Boot 3.5.16 · Spring AI **1.1.8** (GA, Maven Central — no milestone repository) ·
-springdoc-openapi 2.8.17 · H2 (chat memory) · backend = any OpenAI-protocol server; all measurements below
-were taken against Ollama 0.20.7 with `qwen2.5:0.5b-instruct` (chat) + `all-minilm` (384-dim embeddings).
+springdoc-openapi 2.8.17 · H2 (chat memory) · backend = any OpenAI-protocol server. The numeric measurements
+quoted below were taken against Ollama 0.20.7 with `qwen2.5:0.5b-instruct` (chat) + `all-minilm` (384-dim
+embeddings); the Termux launcher (`start-offline-llm.sh`) instead runs llama.cpp with **Qwen2.5-1.5B** on 8081
+and a **dedicated** `all-minilm` server on 8082 (`app.embedding.base-url`), so its answers and scores are
+stronger than the 0.5B figures here.
 
 ---
 
@@ -16,15 +19,17 @@ were taken against Ollama 0.20.7 with `qwen2.5:0.5b-instruct` (chat) + `all-mini
   │
   ├─ EndpointLoggingFilter        HIGHEST_PRECEDENCE      requestId → MDC, one line per call
   ├─ AiConcurrencyLimitFilter     HIGHEST_PRECEDENCE+100  ≤4 model calls, else 503 + Retry-After
+  ├─ AiRequestMetricsFilter       HIGHEST_PRECEDENCE+300  times every /api/ai call ─► AiMetrics
   │
   ▼
  @RestController (/api/ai/**)
   │   ChatClient ── built once per bean, never per request
   ▼
  Advisor chain (sorted by OrderComparator, stable)
-  │   TokenUsageAdvisor              order = LOWEST_PRECEDENCE - 1
-  │   MessageChatMemoryAdvisor       (conversational client only)
-  │   QuestionAnswerAdvisor          (RAG client only)
+  │   SemanticCacheAdvisor          order = HIGHEST_PRECEDENCE + 10   (chat client only; a hit short-circuits)
+  │   TokenUsageAdvisor             order = LOWEST_PRECEDENCE - 1
+  │   MessageChatMemoryAdvisor      (conversational client only)
+  │   QuestionAnswerAdvisor         (RAG client only) ─► HybridVectorStore ─► SimpleVectorStore
   │   ChatModelCallAdvisor / ChatModelStreamAdvisor   ← appended by Spring AI, order = MAX_VALUE
   ▼
  ChatModel (OpenAI starter) ──► RestClient / WebClient ──► model backend
@@ -92,11 +97,14 @@ Also read from bytecode, and the reason `RagQueryResolver` exists as a service r
 | Method | Behaviour | Why |
 | :--- | :--- | :--- |
 | `chatMemory(ChatMemoryRepository)` | `MessageWindowChatMemory` bounded to **6** messages over the auto-configured JDBC repository. | A window, not the whole transcript: the local model's context is small enough that unbounded history pushes the actual question out of the prompt. The repository owns its schema; this bean only bounds the window. |
-| `tokenUsageAdvisorCustomizer()` | `ChatClientCustomizer` adding `TokenUsageAdvisor` to every builder. | Controllers build clients in their constructors (RAG needs a store-specific advisor); a customizer means each one does not re-declare token accounting. |
-| `chatClient(ChatClient.Builder)` | Stateless client with the shared system prompt. | Tools, structured output and vision have no conversation. Since Spring AI **1.1.6** `MessageChatMemoryAdvisor` *rejects* a call with no conversation id, so a memory-carrying client could not serve them even if it were desirable. |
+| `tokenUsageAdvisorCustomizer(AiMetrics)` | `ChatClientCustomizer` adding `TokenUsageAdvisor` to every builder. | Controllers build clients in their constructors (RAG needs a store-specific advisor); a customizer means each one does not re-declare token accounting. It takes `AiMetrics` so the token counters and the `/metrics/summary` roll-up are the same numbers. |
+| `semanticCacheAdvisor(EmbeddingModel, AiMetrics, app.cache.*)` | `SemanticCacheAdvisor` over its own `SimpleVectorStore`. `@Value`-bound `enabled` (true), `similarity-threshold` (0.95), `max-entries` (200), `ttl` (PT30M). | Attached to `chatClient` **alone** — see §10. Its own store, not the knowledge base, so a cached answer can never surface as a RAG citation. |
+| `chatClient(ChatClient.Builder, SemanticCacheAdvisor)` | Stateless client with the shared system prompt; `.defaultAdvisors(semanticCacheAdvisor)`. | Tools, structured output and vision have no conversation. Since Spring AI **1.1.6** `MessageChatMemoryAdvisor` *rejects* a call with no conversation id, so a memory-carrying client could not serve them even if it were desirable. The cache advisor is here and nowhere else, because a request through this client is the only one whose answer is a pure function of the prompt. |
 | `conversationalChatClient(ChatClient.Builder, ChatMemory)` | `@Qualifier("conversationalChatClient")`; adds `MessageChatMemoryAdvisor`. | Serves `/chat/memory`, `/chat/stream`. Every call must supply `ChatMemory.CONVERSATION_ID` — that parameter is what keeps two callers' histories apart. |
 | `ragQueryRewriter(ChatClient.Builder)` | `@Qualifier("ragQueryRewriter")`; system prompt + `temperature 0.0`, `maxTokens 64`, and **no** default advisors. | The follow-up resolver's client. Separate because `defaultAdvisors` accumulates: built from the RAG builder it would inherit `QuestionAnswerAdvisor` and retrieve policy text in answer to its own rewriting instruction. Deterministic options because a rewriter that improvises has to be validated, not trusted. |
+| `embeddingModel(app.embedding.*)` | `@Primary` `OpenAiEmbeddingModel` built against **its own** `base-url` (default `http://localhost:8082`) and model (`all-minilm`), `MetadataMode.EMBED`. | A chat model used as the vectorizer returns vectors that rank near-randomly, and the single `spring.ai.openai.base-url` cannot point chat and embeddings at different servers. `@Primary` because the auto-configured `OpenAiEmbeddingModel` also implements `EmbeddingModel` and would otherwise make the store injection ambiguous. |
 | `vectorStore(EmbeddingModel)` | `SimpleVectorStore` — in-memory, cosine, `all-minilm` vectors. | Zero-infrastructure RAG. Returns the **subtype**, not `VectorStore`, because persistence lives on it (`save`/`load`); every injection point still asks for the interface. Snapshotted to `./data/rag` by `RagStorePersistence`, so uploads survive a restart. The alternative is still a real vector database, which this showcase deliberately does not pull in. |
+| `hybridVectorStore(SimpleVectorStore, KeywordIndex, app.rag.hybrid.*)` | `@Primary` `VectorStore` = `HybridVectorStore`. `enabled` (true), `candidate-pool` (50), `rrf-k` (60). | What every `VectorStore` injection point actually receives, so the `QuestionAnswerAdvisor`, `/rag/search` and the knowledge-base tool get BM25-fused ranking without knowing it. Callers that need the raw store (`save`/`load`, the boot enumeration) still ask for the concrete `SimpleVectorStore`. See §10. |
 
 ### [`EndpointLoggingFilter.java`](src/main/java/com/example/springai/config/EndpointLoggingFilter.java)
 
@@ -124,6 +132,15 @@ free the permit mid-stream, so the filter checks `request.isAsyncStarted()` and,
 release to `AsyncContext` completion/error/timeout instead. If the stream already finished between those two
 lines, `getAsyncContext()` throws `IllegalStateException` and the permit is released directly.
 
+### [`AiRequestMetricsFilter.java`](src/main/java/com/example/springai/config/AiRequestMetricsFilter.java)
+
+`OncePerRequestFilter` at `HIGHEST_PRECEDENCE + 300`, i.e. **inside** `AiConcurrencyLimitFilter` (`+100`), so a
+`503` the concurrency filter refuses is never counted as a served call. Times every `/api/ai/**` request and
+folds it into [`AiMetrics`](src/main/java/com/example/springai/observability/AiMetrics.java) — one request per
+call, with the outcome and the wall time. A streamed call is measured down to the point the request goes async
+(time to first byte), not the end of the generation; the `Flux` is still producing when the filter's `finally`
+runs. See §10.
+
 ### [`OpenApiConfig.java`](src/main/java/com/example/springai/config/OpenApiConfig.java)
 
 Sets the document title, version and a description naming the environment variables a caller must set — the
@@ -144,6 +161,10 @@ API is useless without knowing which model is wired in.
 | `conversationHistory` | `GET /api/ai/chat/memory/history` | Reads `ChatMemory.get(id)` — shows what the advisor will inject, not what the model said. |
 | `clearConversation` | `DELETE /api/ai/chat/memory` | `ChatMemory.clear(id)`. |
 
+Every answer that leaves this controller passes through `PiiRedactor.redact(...)` — including the streamed
+chunks (`.map(piiRedactor::redact)`) — so a model that echoes an email or a card number does not publish it.
+See §6 for the guardrails.
+
 `ConversationIds.requireNonBlank` rejects blanks and lengths above **36 characters** at the boundary. The JDBC
 schema stores the id in `VARCHAR(36)`, so a longer value fails on insert deep inside `JdbcTemplate` and arrives as an
 opaque 500.
@@ -159,27 +180,51 @@ as "no conversation" and stays the single-shot endpoint it was. Same 36-characte
 | :--- | :--- | :--- |
 | `queryKnowledgeBase` | `POST /api/ai/rag/query` | `QuestionAnswerAdvisor` retrieves, the model answers, and citations come from `response.context().get(RETRIEVED_DOCUMENTS)` — literally the chunks that reached the prompt. `filename` maps to the advisor's `FILTER_EXPRESSION` parameter. `RagQueryRequest` is `{question, filename, conversationId}`: how many chunks get injected is `app.rag.top-k`, a deployment setting, and the per-request `topK` field that used to sit here was validated, documented and never read. The retrieval text is `queryResolver.resolve(...)` first and `.user(...)` second — see §2 for why an advisor cannot do this — and the turn is written back with `queryResolver.remember(...)` only after a non-blank answer, never from a failure path. |
 | `rawVectorSearch` | `GET /api/ai/rag/search` | `similarityThresholdAll()` plus an optional `FilterExpressionBuilder().eq("filename", …)`. Surfaces `Document.getScore()`. When nothing matches it returns `totalResults: 0` **and** a `note`, because an inspection endpoint that returns a bare empty list cannot be told apart from an empty store. |
-| `addDocument` | `POST /api/ai/rag/documents` | `multipart/form-data`, ≤512 KB per file, `evict(filename)` before `ingest(...)` so re-uploading replaces instead of duplicating. |
+| `addDocument` | `POST /api/ai/rag/documents` | `multipart/form-data`, ≤512 KB per file, text-like content types only (else `415`), screened for prompt-injection patterns (else `422` — see below), then `evict(filename)` before `ingest(...)` so re-uploading replaces instead of duplicating. |
 
-Two guards are load-bearing:
+The constructor injects `VectorStore` (which is the `@Primary` `HybridVectorStore`, §10) and both guardrails,
+so `/query` retrieves through hybrid search and both `/query` and `/documents` are screened.
+
+Three guards are load-bearing:
 
 - **Filename whitelist.** A filename is interpolated into a filter expression, so `[A-Za-z0-9._\-]{1,120}` is
   enforced instead of escaping — anything else is rejected before the expression is built.
 - **Explicit `consumes = MULTIPART_FORM_DATA_VALUE`.** Without it springdoc documents the part as
   `application/json`, and Swagger UI renders a JSON body editor for a part that only exists as multipart, so
   "Try it out" cannot pick a file.
+- **Prompt-injection screening at ingest.** An uploaded chunk is later injected into a prompt as *context*, so
+  a document saying "ignore your instructions" is an indirect injection aimed at every future answer. The file
+  bytes are read and scanned before indexing; a match is `422 request_rejected` unless
+  `app.guardrails.block-injection-on-ingest=false`. See §6.
+
+The grounded answer is redacted with `PiiRedactor` before it is returned **and** before it is written back to
+chat memory; a match is logged `[GUARDRAIL] redacted [<rules>] from a RAG answer for question=…`. The
+citations are the raw chunks, so redaction never hides what retrieval actually found.
 
 Threshold reasoning, because it looks arbitrary: `all-minilm` cosine for a relevant short question against
 these chunks lands around 0.3–0.45. At the 0.5 default the advisor silently drops the context and the model
 answers from memory — the endpoint still returns a fluent sentence, with `sourceDocuments` proving the chunk
-was found and never used. Hence `app.rag.similarity-threshold: 0.2`.
+was found and never used. Hence `app.rag.similarity-threshold: 0.2`. The threshold applies to the vector leg of
+`HybridVectorStore`; the keyword leg can still add a chunk the floor alone would have dropped (§10).
 
 ### [`ToolCallingController.java`](src/main/java/com/example/springai/controller/ToolCallingController.java)
 
-`GET /tools/weather`, `/tools/order`, `/tools/multi` bind tools **by bean name** with
-`.toolNames("getCurrentWeather")` / `("getOrderStatus")`, at temperature 0.2 for the single-tool endpoints.
-`answered(...)` logs a warning when the model returns no completion, so an empty answer is not mistaken for a
-successful call.
+| Method | Route | Tools bound | Notes |
+| :--- | :--- | :--- | :--- |
+| `queryWeather` | `GET /tools/weather` | `getCurrentWeather` | temperature 0.2 |
+| `queryOrder` | `GET /tools/order` | `getOrderStatus` | temperature 0.2 |
+| `multiToolQuery` | `GET /tools/multi` | `getCurrentWeather`, `getOrderStatus` | default temperature |
+| `calculate` | `GET /tools/calculate` | `calculate` | temperature 0.2 |
+| `dateTime` | `GET /tools/datetime` | `getCurrentDateTime` | temperature 0.2 |
+| `assistant` | `GET /tools/assistant` | all five (`ALL_TOOLS`) | stateless without a `conversationId`, memory-aware with one; temperature 0.2 |
+| `assistantStream` | `GET /tools/assistant/stream` | all five | `text/event-stream`; tool calls run before the first token, so the stream is the composing answer |
+| `agent` | `GET /tools/agent` | `app.agent.tools` | delegates to `AgenticLoopService`, returns the step trace (§10) |
+
+Tools are bound **by bean name** with `.toolNames(...)`. `answered(...)` logs a warning when the model returns
+no completion, so an empty answer is not mistaken for a successful call, and passes the answer through
+`PiiRedactor` — a tool result that echoes personal data does not leave the endpoint. The `assistant`/`agent`
+routes expose the whole toolbox (weather, order, calculator, clock, and the knowledge base as
+`searchKnowledgeBase`), so the model can chain arithmetic or retrieval in one turn.
 
 Temperature 0.2 is empirical, not decorative: on `qwen2.5:0.5b-instruct`, 0.2 called both tools in most runs,
 **0.0 stopped calling them**, and an "answer only from the tool result" system prompt made the model describe
@@ -216,6 +261,12 @@ resized-thumbnail paths with 400) into a `byte[]`, so the media type comes from 
 than a guessed extension; it is attached as `new Media(mimeType, new ByteArrayResource(bytes))`. Download
 failures raise `ImageDownloadException` → 400; model failures propagate so the advice can report the real
 status and cause.
+
+### [`MetricsController.java`](src/main/java/com/example/springai/controller/MetricsController.java)
+
+`GET /api/ai/metrics/summary` returns `AiMetrics.summary()` verbatim — one JSON object with `uptimeSeconds`,
+`requests` / `tokens` / `cache` / `latencyMs` blocks, so the demo page can show what the process has served
+without a metrics stack. The per-series view is still `/actuator/metrics`. See §10.
 
 ---
 
@@ -320,13 +371,28 @@ non-empty, one `similaritySearch(query "policy", topK 1, similarityThresholdAll(
 it raises instead of returning, the snapshot is **kept** with a debug line — re-indexing would fail for the same
 reason and only leave the store emptier.
 
-### [`OrderToolService.java`](src/main/java/com/example/springai/service/OrderToolService.java) / [`WeatherToolService.java`](src/main/java/com/example/springai/service/WeatherToolService.java)
+### The tool services — [`OrderToolService.java`](src/main/java/com/example/springai/service/OrderToolService.java), [`WeatherToolService.java`](src/main/java/com/example/springai/service/WeatherToolService.java), [`CalculatorToolService.java`](src/main/java/com/example/springai/service/CalculatorToolService.java), [`DateTimeToolService.java`](src/main/java/com/example/springai/service/DateTimeToolService.java), [`KnowledgeBaseToolService.java`](src/main/java/com/example/springai/service/KnowledgeBaseToolService.java)
 
-`@Bean` + `@Description` `Function<Request, Details>` over in-memory fixtures. Each logs
-`[SPRING-AI-TOOL] Executing … for …=<arg>`; grepping that line is the only proof that a tool ran instead of
-the model inventing an answer (the 0.5B model fabricates weather roughly half the time and leaves no such
-line). Request records are trimmed and upper-cased in the tool, and `@Description` is the text the model sees
-when deciding whether to call it.
+Each is an `@Configuration` exposing a `@Bean @Description Function<Request, …>`; the bean name is the tool
+name `.toolNames(...)` binds. Every one logs `[SPRING-AI-TOOL] Executing … for …=<arg>` — grepping that line is
+the only proof a tool ran instead of the model inventing an answer (the 0.5B model fabricates weather roughly
+half the time and leaves no such line). `@Description` is the text the model sees when deciding whether to call
+it.
+
+- **weather / order** — in-memory fixtures; request records trimmed and upper-cased in the tool.
+- **`calculate`** — `+ - * / % ^` and parentheses, evaluated by a hand-written recursive-descent parser, not a
+  script engine, so there is no code-execution surface; an unparsed tail is returned as `error: unexpected
+  input at position …`.
+- **`getCurrentDateTime`** — a trustworthy clock (`ZoneId`/`ZonedDateTime`), because a small model answers "what
+  time is it" from training data. An unknown zone is returned as an `error` string rather than thrown, so the
+  model can retry with an IANA name.
+- **`searchKnowledgeBase`** — RAG exposed as a *tool*: the model decides a question needs the knowledge base,
+  and the tool searches the (hybrid, `@Primary`) store with a **zero** floor, the same as `/rag/search`, because
+  a threshold tuned for the grounded endpoint would silently empty the tool's answer. Used by the agentic and
+  assistant routes; `/rag/query` keeps its advisor.
+
+[`AgenticLoopService`](src/main/java/com/example/springai/agent/AgenticLoopService.java) drives the same
+toolbox by hand for `GET /tools/agent` — see §10.
 
 ---
 
@@ -364,7 +430,37 @@ latency visible.
 ### [`TokenUsageAdvisor.java`](src/main/java/com/example/springai/advisor/TokenUsageAdvisor.java)
 
 `before` is identity; `after` logs to the `TOKEN_USAGE` logger. See §2 for the ordering requirement and the
-zero-usage stream case.
+zero-usage stream case. It also folds the counts into `AiMetrics`, so the token line and `/metrics/summary`
+agree.
+
+### [`PiiRedactor.java`](src/main/java/com/example/springai/guardrail/PiiRedactor.java)
+
+`@Component` masking personal data in model output before it leaves the API. Regex-based and deliberately
+conservative — it is a last line over output, not a classifier, so it errs toward masking a lookalike. Five
+named rules (email, phone, ssn, ipv4, card) so the audit line can say *what* was masked without repeating the
+value; the card rule is Luhn-checked, so a 16-digit order id is not reported as a PAN. `redact(text)` returns
+the masked text (or the original when `app.guardrails.redact-output=false`); `findings`/`summary` give the rule
+names for the log line. Wired into `ChatController`, `ToolCallingController` and `RagController` — including
+the streamed paths.
+
+### [`PromptInjectionDetector.java`](src/main/java/com/example/springai/guardrail/PromptInjectionDetector.java)
+
+`@Component` screening text for instruction-override patterns **before it is indexed as knowledge**. A
+retrieved chunk is injected into the prompt as if it were context, so a document that says "ignore your
+instructions" is an indirect injection — which is why this runs at ingest, not at query time. Five named rules
+(instruction-override, system-prompt-probe, role-reassignment, exfiltration, tool-coercion); `scan` returns the
+matched rule names, empty when clean. Heuristic and intentionally blunt: it gates *who may add documents*, it
+is not a classifier. Enforced in `RagController.addDocument` unless `block-injection-on-ingest=false`.
+
+### [`AiMetrics.java`](src/main/java/com/example/springai/observability/AiMetrics.java)
+
+`@Component` holding the in-process roll-up behind `GET /api/ai/metrics/summary`: requests (total, errors,
+per-endpoint) and tokens via `LongAdder`s, cache hits/misses, and latency p50/p95/max/average from a bounded
+ring of the last **512** request times. The Micrometer instruments (`ai.requests.total`, `ai.tokens.total`,
+`ai.latency`, `ai.cache.requests.total`) are the durable record; the in-process counters exist because a
+Micrometer counter cannot be enumerated back into a per-endpoint table without already knowing every tag value.
+Fed by `AiRequestMetricsFilter` (requests/latency), `TokenUsageAdvisor` (tokens) and `SemanticCacheAdvisor`
+(cache). See §10.
 
 ---
 
@@ -415,10 +511,12 @@ upload → 1 chunk → restart → 3 chunks.
 ```bash
 mvn -B test                              # 101 tests: 98 run offline, 3 skipped
 mvn -B test -Dapp.rag.eval=true          # + the two live tier-2 tables (golden questions, follow-ups)
+mvn -B test -Dapp.rag.judge=true         # + tier 3: an LLM-as-judge groundedness table (two prompts/row)
 ```
 
-Three tiers, separated by what they need to be up — not by a tag, because a tag would need surefire
-configuration and the build file is deliberately untouched.
+Four tiers, separated by what they need to be up — not by a tag, because a tag would need surefire
+configuration and the build file is deliberately untouched. The 3 skipped are tier 2's two methods plus tier
+3's single test, all `@EnabledIfSystemProperty`.
 
 **Tier 0 — endpoints, no model.** `ControllerIntegrationTest` builds MockMvc standalone and fakes `ChatClient`
 with `java.lang.reflect.Proxy`
@@ -479,6 +577,21 @@ golden questions, and the follow-up table at the served floor, report-only for t
 embedder one row went from *the floor dropping its gold chunk entirely* to rank 1 at 0.604 once resolved, while
 the other two already ranked 1 unresolved, which is a result you do not want a green build hiding.
 
+**Tier 3 — groundedness, the answer not the retrieval.** `GroundednessJudgeTest` is
+`@EnabledIfSystemProperty(named = "app.rag.judge", matches = "true")`. It cannot be a tier-1 assertion, because
+a retrieval tier sees which chunk was retrieved but not whether the model *used* it — a context-blending or
+context-ignoring model passes every rank check. It retrieves for up to five answerable golden questions,
+answers strictly from the retrieved context, then asks the same model to grade the answer 0–3 against that
+context. Scores are **printed, never gated** (a 1.5B judge is itself noisy); the only assertion is that every
+row produced a parseable digit, which is the infrastructure claim. It overrides `spring.datasource.url` to an
+in-memory H2 for the same file-lock reason tier 2 does.
+
+The rest of the 98 is offline unit tests, among them `HybridRetrievalTest` (the BM25 fusion),
+`SemanticCacheAdvisorTest` (including the `MetadataInclusiveEmbeddingModel` that pins the cache-key asymmetry,
+§10), `AgenticLoopServiceTest` and `AiMetricsTest` (the enhancement round), `CalculatorToolServiceTest`,
+`DateTimeToolServiceTest`, `KnowledgeBaseToolServiceTest`, `PiiRedactorTest`, `PromptInjectionDetectorTest`
+(tools + guardrails), `StructuredOutputConverterTest`, and the existing tool/record mapping tests.
+
 **What still needs a real model:** grounded RAG *answers*, token log lines, tool execution, SSE incremental
 delivery, health DOWN with no backend. See `README.md`.
 
@@ -522,6 +635,12 @@ the keyword leg matched a query term — the union is what recovers the acronym 
 corpus is small, so the vector leg runs over a pool at least as wide as the index, meaning a keyword-only
 document still usually carries a real cosine to report. `rebuildKeywordIndex()` repopulates the BM25 leg after
 `RagStorePersistence` restores chunks straight into the inner store, bypassing this decorator's `add`.
+
+The keyword leg runs in this process, so it cannot hand a filter expression to the store the way the vector leg
+does; [`MetadataFilters`](src/main/java/com/example/springai/vectorstore/MetadataFilters.java) evaluates the
+`Filter.Expression` against each document's metadata itself, supporting the `EQ` / `AND` / `OR` / `NOT`
+operators the app builds and matching everything on anything exotic, so a filter it cannot read weakens the
+keyword leg rather than failing the request.
 
 ### [`AgenticLoopService.java`](src/main/java/com/example/springai/agent/AgenticLoopService.java)
 

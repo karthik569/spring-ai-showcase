@@ -9,8 +9,9 @@ operational layer a model-backed endpoint needs: **timeouts, a live LLM health c
 correlated request logging, and OpenAPI docs**.
 
 Any OpenAI-protocol backend works — local Ollama, LM Studio, llama.cpp's server, or a hosted API key. Nothing
-in the code is model-specific, but every sample output below was produced by `qwen2.5:0.5b-instruct`, so read
-§Known limits before judging the answers.
+in the code is model-specific. The sample outputs below were produced by `qwen2.5:0.5b-instruct` via Ollama,
+so read §Known limits before judging the answers; the shipped Termux launcher instead runs a larger
+**Qwen2.5-1.5B** with a dedicated `all-minilm` embedder, so its answers are stronger than the 0.5B samples.
 
 > **New to Spring AI?** Start with **[docs/GETTING_STARTED.md](docs/GETTING_STARTED.md)** — prerequisites, a
 > plain-language glossary, and a five-step guided tour that runs every capability in learning order. This file
@@ -37,7 +38,7 @@ Then open:
 
 | URL | What it is |
 | :--- | :--- |
-| `http://localhost:8080/` | Demo UI — ten panels, one per capability, with a live `requestId` on every result |
+| `http://localhost:8080/` | Demo UI — eleven panels, one per capability, with a live `requestId` on every result |
 | `http://localhost:8080/docs` | Swagger UI (302 → `/swagger-ui/index.html`), served from the OpenAPI document at `/v3/api-docs` |
 | `http://localhost:8080/actuator/health` | Includes the `llm` component, which sends a one-token prompt and reports model, latency and reply |
 
@@ -67,16 +68,24 @@ records request and response **bodies** but never **headers**, so a key cannot r
 ### Termux / llama.cpp
 
 `start-offline-llm.sh` and `start-spring-ai.sh` are Termux-only (`cd /sdcard/...`, `llama-server`) and do not
-work on Windows or macOS. They still start an OpenAI-compatible llama.cpp server on port 8081; note that
-server's `--embedding` flag reuses the chat weights as the embedder, which is exactly the caveat above, so RAG
-scores from that mode are not meaningful.
+work on Windows or macOS. `start-offline-llm.sh` starts **two** llama.cpp servers, because `llama-server` loads
+one model per process:
+
+| Port | Model | Env |
+| :--- | :--- | :--- |
+| 8081 | `Qwen2.5-1.5B-Instruct` (Q4_K_M GGUF) | `OPENAI_BASE_URL` |
+| 8082 | `all-MiniLM-L6-v2` (quantized, **embeddings**) | `OPENAI_EMBEDDING_BASE_URL` |
+
+The embedder is a *real* embedding model on its own port, wired through `app.embedding.base-url` — this is the
+caveat above handled the right way, so RAG scores from this mode are meaningful. (The chat server also accepts
+`--embedding`, but that reuses the chat weights and is exactly what you must not point the vectorizer at.)
 
 ---
 
 ## 🏛 System Architecture
 
 ```
- Browser ── GET / ──────────► static/index.html   ten panels, EventSource for /chat/stream
+ Browser ── GET / ──────────► static/index.html   eleven panels, EventSource for /chat/stream
  cURL   ── GET /docs ───────► Swagger UI          OpenAPI 3.1 document at /v3/api-docs
  cURL   ── GET|POST /api/ai/** ──► controllers
 
@@ -84,13 +93,15 @@ scores from that mode are not meaningful.
       │
       ├─ EndpointLoggingFilter      requestId → MDC, one line per call in logs/endpoints.log
       ├─ AiConcurrencyLimitFilter   ≤4 model calls in flight, else 503 + Retry-After
+      ├─ AiRequestMetricsFilter     times every /api/ai call ─► AiMetrics ─► /api/ai/metrics/summary
       │
       ├─ ChatController            ┐
       ├─ RagController             │
       ├─ ToolCallingController     ├─► ChatClient ─► advisor chain (stable-sorted)
-      ├─ StructuredOutputController│        │   TokenUsageAdvisor          LOWEST_PRECEDENCE - 1
-      └─ MultimodalController      ┘        │   MessageChatMemoryAdvisor   window 6  ─► H2 ./data/chat-memory
-                                            │   QuestionAnswerAdvisor      topK 4     ─► SimpleVectorStore ─► ./data/rag/*.json
+      ├─ StructuredOutputController│        │   SemanticCacheAdvisor     HIGHEST_PRECEDENCE + 10 (chat only, short-circuits)
+      ├─ MultimodalController      │        │   TokenUsageAdvisor          LOWEST_PRECEDENCE - 1
+      └─ MetricsController         ┘        │   MessageChatMemoryAdvisor   window 6  ─► H2 ./data/chat-memory
+                                            │   QuestionAnswerAdvisor     topK 4     ─► HybridVectorStore ─► SimpleVectorStore ─► ./data/rag/*.json
                                             ▼
       OpenAI-protocol backend: Ollama · OpenAI · LM Studio · llama.cpp
                                             │
@@ -116,7 +127,7 @@ runs. `TokenUsageAdvisor` uses `LOWEST_PRECEDENCE - 1` for that reason — see
 | **Follow-ups resolved before retrieval** | [`RagQueryResolver.java`](src/main/java/com/example/springai/service/RagQueryResolver.java) | A `conversationId` on `/rag/query` buys one cheap model call that rewrites "how long do I have to submit that?" into text an embedder can answer, reading persisted chat memory directly — the retrieval advisor builds its query from the user message and cannot see injected history. Validation decides, not the model's own confidence. |
 | **Knowledge base that survives a restart** | [`RagStorePersistence.java`](src/main/java/com/example/springai/service/RagStorePersistence.java) | `SimpleVectorStore.save`/`load` over two files in `./data/rag`, plus a per-filename SHA-256 manifest so an unchanged shipped document is not re-embedded and a truncated snapshot is discarded loudly instead of silently empty. |
 | **Offline retrieval eval** | [`GoldenQuestionsTest.java`](src/test/java/com/example/springai/rag/GoldenQuestionsTest.java), [`FollowUpRetrievalTest.java`](src/test/java/com/example/springai/rag/FollowUpRetrievalTest.java), [`LiveRetrievalComparisonTest.java`](src/test/java/com/example/springai/rag/LiveRetrievalComparisonTest.java) | 15 golden questions with verbatim answer markers plus 3 follow-up rows, rank-based metrics, and a stub embedder that makes the real cosine/filter/threshold code assertable with Ollama switched off. |
-| **Tool / Function calling** | [`ToolCallingController.java`](src/main/java/com/example/springai/controller/ToolCallingController.java) | `Function<Request, Response>` beans described with `@Description` ([`WeatherToolService`](src/main/java/com/example/springai/service/WeatherToolService.java), [`OrderToolService`](src/main/java/com/example/springai/service/OrderToolService.java)), bound per call with `.toolNames(...)`; the model decides whether to invoke them. |
+| **Tool / Function calling** | [`ToolCallingController.java`](src/main/java/com/example/springai/controller/ToolCallingController.java) | `Function<Request, Response>` beans described with `@Description` — weather, order, [`calculate`](src/main/java/com/example/springai/service/CalculatorToolService.java) (`+ - * / % ^`, hand-parsed, no script engine), [`getCurrentDateTime`](src/main/java/com/example/springai/service/DateTimeToolService.java), and [`searchKnowledgeBase`](src/main/java/com/example/springai/service/KnowledgeBaseToolService.java) (RAG as a tool) — bound per call with `.toolNames(...)`; the model decides whether to invoke them. `/tools/assistant` offers all five. |
 | **Structured output** | [`StructuredOutputController.java`](src/main/java/com/example/springai/controller/StructuredOutputController.java) | `responseEntity(...)` parses into the record and keeps the raw completion; a flat answer shape is restated after the schema, an incomplete record retries once, then `422` with `rawModelOutput`. |
 | **Multimodal vision** | [`MultimodalController.java`](src/main/java/com/example/springai/controller/MultimodalController.java) | Server-side download with a `User-Agent`, address-class screening, `Media` attachment on the prompt. |
 | **Resilience & ops** | [`AiConcurrencyLimitFilter`](src/main/java/com/example/springai/config/AiConcurrencyLimitFilter.java), [`LlmHealthIndicator`](src/main/java/com/example/springai/health/LlmHealthIndicator.java), [`GlobalExceptionHandler`](src/main/java/com/example/springai/error/GlobalExceptionHandler.java) | HTTP timeouts, a cached live probe, a semaphore ceiling with `Retry-After`, and typed error bodies instead of container stack dumps. |
@@ -124,6 +135,7 @@ runs. `TokenUsageAdvisor` uses `LOWEST_PRECEDENCE - 1` for that reason — see
 | **Hybrid retrieval (BM25 + vector)** | [`HybridVectorStore.java`](src/main/java/com/example/springai/vectorstore/HybridVectorStore.java), [`KeywordIndex.java`](src/main/java/com/example/springai/vectorstore/KeywordIndex.java) | A `@Primary` `VectorStore` decorator that fuses the cosine ranking with a BM25 keyword ranking by reciprocal rank fusion, recovering a chunk that matches on a rare literal term (an acronym) but scores poorly as an embedding. Every caller (`QuestionAnswerAdvisor`, `/rag/search`, the knowledge-base tool) gets it for free; off via `RAG_HYBRID_ENABLED=false`. |
 | **Agentic multi-step loop** | [`AgenticLoopService.java`](src/main/java/com/example/springai/agent/AgenticLoopService.java) | `GET /api/ai/tools/agent` drives the tool-calling loop by hand — model call, `ToolCallingManager.executeToolCalls`, repeat — bounded by `app.agent.max-steps`, and returns the full ordered step trace. Hand-rolled rather than delegated to Spring AI's internal loop so each round is visible. |
 | **Observability & cost** | [`AiMetrics.java`](src/main/java/com/example/springai/observability/AiMetrics.java), [`AiRequestMetricsFilter.java`](src/main/java/com/example/springai/config/AiRequestMetricsFilter.java), [`MetricsController.java`](src/main/java/com/example/springai/controller/MetricsController.java) | A servlet filter folds every `/api/ai` call into requests / tokens / cache hit-rate / latency percentiles, rendered at `GET /api/ai/metrics/summary` and also exported as Micrometer counters (`ai.requests.total`, `ai.tokens.total`, `ai.latency`, `ai.cache.requests.total`). |
+| **Guardrails** | [`PiiRedactor.java`](src/main/java/com/example/springai/guardrail/PiiRedactor.java), [`PromptInjectionDetector.java`](src/main/java/com/example/springai/guardrail/PromptInjectionDetector.java) | `PiiRedactor` masks personal data (email/phone/ssn/ipv4/Luhn-checked card) from every answer before it leaves the API, including streamed chunks. `PromptInjectionDetector` screens uploaded documents for instruction-override patterns at ingest time — a retrieved chunk is injected as *context*, so an "ignore your instructions" document is an indirect injection. Knobs: `app.guardrails.redact-output`, `app.guardrails.block-injection-on-ingest`. |
 | **Docs & demo UI** | [`OpenApiConfig.java`](src/main/java/com/example/springai/config/OpenApiConfig.java), [`index.html`](src/main/resources/static/index.html) | springdoc 2.8.17 (2.8.x is the Boot 3 line) and a dependency-free static page. |
 
 ---
@@ -417,6 +429,12 @@ curl "http://localhost:8080/api/ai/rag/search?query=failover&topK=2&filename=ops
 Re-uploading a filename **replaces** its previous chunks, so iterating on a document does not double its
 presence in every answer.
 
+Uploads are guarded: a non-text content type is rejected `415`, and a document matching an instruction-override
+pattern ("ignore your previous instructions", "reveal your system prompt", …) is rejected `422 request_rejected`
+before it is indexed — a retrieved chunk is injected as context, so an uploaded injection targets every later
+answer. Set `app.guardrails.block-injection-on-ingest=false` to index it anyway (the match is still logged).
+Answers from `/rag/query` are passed through `PiiRedactor` before they are returned or stored.
+
 #### What the knowledge base does on restart
 
 The store is in memory while the process runs and is snapshotted to disk on every index change, so an upload
@@ -463,10 +481,15 @@ the result back.
 curl "http://localhost:8080/api/ai/tools/weather?prompt=What+is+the+weather+in+Tokyo+right+now?"
 curl "http://localhost:8080/api/ai/tools/order?prompt=What+is+the+delivery+status+of+order+ORD-101?"
 curl "http://localhost:8080/api/ai/tools/multi?prompt=Check+the+weather+in+London+and+the+shipping+status+of+order+ORD-103"
+curl "http://localhost:8080/api/ai/tools/calculate?prompt=What+is+128+*+46+%2B+1024?"   # calculate
+curl "http://localhost:8080/api/ai/tools/datetime?prompt=What+time+is+it+in+London?"     # getCurrentDateTime
+curl "http://localhost:8080/api/ai/tools/assistant?prompt=How+many+days+of+leave+do+I+get,+times+3?"  # all five tools
 ```
 
-`grep SPRING-AI-TOOL logs/app.log` proves a tool actually executed — a plausible answer without that line was
-invented by the model, which a 494M-parameter model does roughly half the time on the weather fixture.
+`assistant` also accepts an optional `conversationId` (memory-aware), and `GET /api/ai/tools/assistant/stream`
+is the same call as `text/event-stream`. `grep SPRING-AI-TOOL logs/app.log` proves a tool actually executed — a
+plausible answer without that line was invented by the model, which a 494M-parameter model does roughly half
+the time on the weather fixture.
 
 ### 8. Multimodal vision analysis
 `GET /api/ai/vision/analyze?imageUrl=...&question=...`
@@ -576,4 +599,5 @@ the ceiling:
   "answer only from the tool result" system prompt made the model describe the tool instead of using it.
 - No image encoder, so vision needs a different model.
 
-A larger local model (3B+ instruct, plus a vision model) or a hosted key moves all of them.
+A larger local model (3B+ instruct, plus a vision model) or a hosted key moves all of them — the Termux
+launcher's Qwen2.5-1.5B is already a step up from the figures quoted here.

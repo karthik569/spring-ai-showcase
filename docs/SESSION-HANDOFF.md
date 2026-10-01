@@ -1,17 +1,17 @@
 # Session handoff — spring-ai-showcase
 
-Working notes so the next person (or model) can resume cold. Updated 2026-09-30 on Windows.
+Working notes so the next person (or model) can resume cold. Last updated 2026-10-01, on Termux/PRoot arm64
+(the earlier sections below were written on Windows and are kept as history).
 Not project documentation — see `docs/GETTING_STARTED.md` (on-ramp), `README.md` (reference) and
 `ARCHITECTURE_AND_METHODS.md` (the why) for that.
 
-**Start here:** Spring Boot **3.5.16** + Spring AI **1.1.8** (GA) on local Ollama (`qwen2.5:0.5b-instruct` chat
-+ `all-minilm` embeddings). The upgrade, the new capabilities (RAG upload/filters/scores, persisted memory +
-history, token metrics, demo UI, Swagger, timeouts/health/concurrency) are **done and verified live**, and
-`README.md` / `ARCHITECTURE_AND_METHODS.md` now describe them, and **`docs/GETTING_STARTED.md`** is the new
-beginner on-ramp (prerequisites, plain-language glossary, five verified steps in learning order) — committed as
-`cf28b41` along with the README pointer. The upgrade itself is `e1b9ade` (+ `2b35ca4`, which recorded the SHA).
-Rather than restating push state here (it went stale twice), check it: `git log --oneline origin/main..HEAD`
-lists whatever is still local.
+**Start here:** Spring Boot **3.5.16** + Spring AI **1.1.8** (GA). Two run modes, both verified:
+Ollama (`qwen2.5:0.5b-instruct` + `all-minilm`, what the README samples were measured on) and the shipped
+llama.cpp launcher (`start-offline-llm.sh`: **Qwen2.5-1.5B** on 8081, **all-minilm** on 8082 via
+`app.embedding.base-url`). The upgrade and the shipped capabilities are **done and verified live**, and
+`README.md` / `ARCHITECTURE_AND_METHODS.md` / `docs/GETTING_STARTED.md` describe them. Rather than restating
+push state here (it went stale twice), check it: `git log --oneline origin/main..HEAD` lists whatever is still
+local.
 
 ## Environment (this machine)
 
@@ -20,9 +20,9 @@ lists whatever is still local.
   springdoc-openapi 2.8.17, H2 for chat memory
 - Ollama 0.20.7, CUDA GPU, **4 GB VRAM**; models cached: `qwen2.5:0.5b-instruct` (397 MB, Q4_K_M),
   `all-minilm` (45 MB, 384-dim embedder)
-- `start-offline-llm.sh` / `start-spring-ai.sh` are **Termux-only** (`cd /sdcard/...`, `llama-server`) and do
-  not work on Windows or macOS. They also reuse the chat weights as the embedder (`--embedding --pooling mean`),
-  which is the one thing RAG must not do now that scores are surfaced.
+- On Windows the scripts do not run (`cd /sdcard/...`, `llama-server`). On Termux they now start **two**
+  servers — chat (Qwen2.5-1.5B) on 8081 and a dedicated all-minilm embedder on 8082 — so the vectorizer is a
+  real embedding model, not the chat weights. (`start-spring-ai.sh` sets `OPENAI_EMBEDDING_BASE_URL=8082`.)
 
 ## Run commands (verified this session)
 
@@ -80,8 +80,10 @@ mvn -B spring-boot:run > run.log 2>&1 &
    `-Dapp.rag.eval=true` and *reports* rather than asserts.
 3. **`RagQueryRequest.topK` is gone** (see §Traps) along with `index.html` sending it and the README claiming it
    worked.
-4. **Not built:** hybrid retrieval (BM25 + RRF) and the grounding gate. Both are designed in the approved plan,
-   and §Open work item 6 records the two measurements that undercut their premises — read it before starting.
+4. **Not built (as of this date):** hybrid retrieval (BM25 + RRF) and the grounding gate. Both were designed in
+   the approved plan, and §Open work item 6 records the two measurements that undercut their premises.
+   *(Superseded: hybrid retrieval shipped on 2026-10-01 — the next section — and groundedness became a tier-3
+   judge, `GroundednessJudgeTest`.)*
 5. **Still deliberately untouched:** `pom.xml` (so tier 2 is opted in by system property, not excluded by a
    surefire tag), `src/main/resources/docs/` (one shipped fixture), and any real vector store.
 
@@ -423,8 +425,10 @@ moves them.
    invalidate every quoted `Indexed 3 chunks` line and every score sample in `README.md` §6 and
    `docs/GETTING_STARTED.md` — those numbers were measured, not invented, and re-measuring them is a separate
    pass.
-6. **The C/D design in the approved plan rests on two premises that measurement contradicted** — re-read before
-   building. (a) *Hybrid retrieval is justified by acronym recall on the vector leg*: with live `all-minilm`, all
+6. **Superseded in part on 2026-10-01: hybrid retrieval (a) shipped as `HybridVectorStore` / `KeywordIndex`,
+   and groundedness became the tier-3 `GroundednessJudgeTest`.** The measurements below are kept because they
+   are *why* hybrid is framed as recall insurance (a second way to be right) rather than a rank fix — read them
+   before changing the fusion. (a) *Hybrid retrieval is justified by acronym recall on the vector leg*: with live `all-minilm`, all
    13 `match` rows — `pto` and `PII` included — came back at **rank 1** (MRR 1.000, same as the stub tier). The
    rank evidence on this corpus says BM25 would be a second way to be right, not a fix. Re-measure unfiltered, on
    a bigger corpus, before writing `Bm25Scorer`. (b) *A grounding gate can be a score comparison*: the `nomatch`
@@ -438,7 +442,8 @@ moves them.
 8. Consider a local model upgrade if factual answers matter more than staying offline.
 9. `ARCHITECTURE_AND_METHODS.md`, `README.md` and `docs/GETTING_STARTED.md` were rewritten against 1.1.8 on
    2026-09-30 — every quoted sample in them was produced by running the command in this repo's shell that day,
-   so the scores carry the drift noted in §Traps. If the version moves again, the rows in
+   so the scores carry the drift noted in §Traps. (They were refreshed on 2026-10-01 to cover the cache /
+   hybrid / agent / metrics / guardrails round, without re-measuring the 0.5B samples.) If the version moves again, the rows in
    `ARCHITECTURE_AND_METHODS.md` §8 (migration table) and the step outputs in `GETTING_STARTED.md` are the
    places that rot first.
 10. **Follow-up resolution is a heuristic with a known failure class.** `PASSTHROUGH` is allowed to happen and
