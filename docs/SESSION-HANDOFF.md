@@ -85,6 +85,46 @@ mvn -B spring-boot:run > run.log 2>&1 &
 5. **Still deliberately untouched:** `pom.xml` (so tier 2 is opted in by system property, not excluded by a
    surefire tag), `src/main/resources/docs/` (one shipped fixture), and any real vector store.
 
+## What changed on 2026-10-01 (the enhancements round — on Termux/Linux, not Windows)
+
+Four showcase extensions, chosen from a menu and all verified live against the local llama.cpp servers
+(chat `qwen2.5-1.5b` on 8081, `all-minilm` on 8082):
+
+1. **Semantic response cache** — `SemanticCacheAdvisor`, the outermost `CallAdvisor`; a paraphrase of an
+   answered question is replayed from a vector index of prior questions without a model call. Skips requests
+   whose answer depends on more than the prompt (tools / conversation / media / output schema). `app.cache.*`,
+   default threshold 0.95.
+2. **Hybrid retrieval** — `HybridVectorStore` (`@Primary` `VectorStore` decorator) fusing the cosine ranking
+   with `KeywordIndex` (BM25) via reciprocal rank fusion. `RAG_HYBRID_ENABLED`, `candidate-pool`, `rrf-k`.
+3. **Agentic multi-step loop** — `AgenticLoopService` + `GET /api/ai/tools/agent`; the loop is driven by hand
+   (model call → `ToolCallingManager.executeToolCalls` → repeat) so each round is a returned `Step`, bounded by
+   `app.agent.max-steps`, toolbox `app.agent.tools`.
+4. **Observability/cost** — `AiMetrics` + `AiRequestMetricsFilter` + `MetricsController` → `GET
+   /api/ai/metrics/summary` (requests, tokens, cache hit rate, latency p50/p95), also exported as Micrometer
+   counters. New demo panel + agent trace in `index.html`.
+
+**The bug worth recording (found only live, never by the suite).** The cache never hit at 0.95: two identical
+`/api/ai/chat` calls produced identical keys yet the lookup scored **0.794**. Root cause, confirmed by
+`javap` on `SimpleVectorStore`: `doAdd` embeds a Document via `EmbeddingModel.embed(Document)` →
+`OpenAiEmbeddingModel.getFormattedContent(MetadataMode.EMBED)` (metadata folded in), while `doSimilaritySearch`
+embeds the bare query `String`. So the stored question was embedded as "question + answer + timestamp" and could
+not match itself. Fixed by giving the stored `Document` a `ContentFormatter` returning only its text. The reason
+the tests missed it: `StubEmbeddingModel.embed(Document)` uses `getText()`, so the shared stub never modelled
+the asymmetry. `SemanticCacheAdvisorTest` now uses a `MetadataInclusiveEmbeddingModel` that does — reverting the
+formatter turns two of its tests red. Live re-check: cold 11.12 s → cached 0.167 s, `cache:{hits:1,misses:1}`.
+
+**Environment traps added this session (Termux/PRoot arm64):**
+
+- **The `Edit`/`Write` tools do not bump mtime on the `/mnt/sdcard` fuse mount**, so Maven's incremental
+  compiler skips the edited file. `touch` every changed file before `mvn`, or the build silently runs old code.
+- **`mvn clean` is unavailable offline** (maven-clean-plugin not in `~/.m2`); rely on the `touch` + recompile.
+- **`pkill -f` / `pgrep -f` self-match** when the pattern appears in the invoking shell's own argv and kill the
+  shell (exit 143). Use `pgrep -x java` and filter `/proc/$pid/cmdline`.
+- **A second app instance cannot share the H2 file** (`./data/chat-memory` is exclusively locked while the app
+  runs). A smoke instance must override `--spring.datasource.url=jdbc:h2:mem:...`.
+- **The agent's ambient env leaks into a spawned app**: `OPENAI_BASE_URL=https://tokenharbor.ai/v1` and friends
+  must be scrubbed with `env -u` and the local `base-url`/dummy key set explicitly, or requests 404 upstream.
+
 ## Phase 0, measured before the conversation-aware RAG code existed (2026-09-30)
 
 The premise of query rewriting is that an unresolved pronoun retrieves the wrong chunk. On this 3-chunk corpus

@@ -161,7 +161,8 @@
     <section>
         <h2>Tool calling</h2>
         <p class="note">The model decides whether to call the registered function; check
-            <code>[SPRING-AI-TOOL]</code> lines in <code>logs/app.log</code> to confirm it did.</p>
+            <code>[SPRING-AI-TOOL]</code> lines in <code>logs/app.log</code> to confirm it did. The
+            <b>agent</b> mode runs a bounded multi-step loop and returns the tool-call trace it followed.</p>
         <label for="toolMode">Endpoint</label>
         <select id="toolMode">
             <option value="weather">weather tool</option>
@@ -170,6 +171,7 @@
             <option value="calculate">calculator tool</option>
             <option value="datetime">date/time tool</option>
             <option value="assistant">assistant (all tools + knowledge base)</option>
+            <option value="agent">agent (bounded multi-step loop)</option>
         </select>
         <label for="toolPrompt">Prompt</label>
         <textarea id="toolPrompt">What is the weather like in Tokyo right now?</textarea>
@@ -261,6 +263,16 @@
         <div class="status" hidden></div>
         <pre hidden></pre>
         <details hidden><summary>raw response</summary><pre class="raw"></pre></details>
+    </section>
+
+    <section>
+        <h2>Usage metrics</h2>
+        <p class="note">In-process roll-up from <code>AiMetrics</code>: requests by endpoint, token totals,
+            semantic-cache hit rate and latency percentiles over the last 512 calls. The same instruments are
+            exposed at <a href="/actuator/metrics">/actuator/metrics</a>.</p>
+        <button data-run="metrics">Refresh</button>
+        <div class="status" hidden></div>
+        <pre hidden></pre>
     </section>
 </div>
 
@@ -372,9 +384,14 @@
                 multi: 'Check the weather in London, and also check the delivery status of order ORD-103.',
                 calculate: 'What is 128 * 46 + 1024?',
                 datetime: 'What time is it in London right now?',
-                assistant: 'How many days of annual leave do I get, and what is 3 times that number?'
+                assistant: 'How many days of annual leave do I get, and what is 3 times that number?',
+                agent: 'How many days of annual leave do I get, and what is 3 times that number?'
             };
             const prompt = document.getElementById('toolPrompt').value.trim() || prompts[mode];
+            if (mode === 'agent') {
+                return call(s, '/api/ai/tools/agent?prompt=' + encodeURIComponent(prompt))
+                    .then((payload) => renderAgentTrace(s, payload));
+            }
             // The conversation id only means anything to the assistant; the single-tool endpoints are stateless.
             const conv = mode === 'assistant' ? value('toolConv') : '';
             return call(s, '/api/ai/tools/' + mode + '?prompt=' + encodeURIComponent(prompt)
@@ -423,9 +440,32 @@
         },
         vision: (s) => call(s, '/api/ai/vision/analyze?imageUrl=' + encodeURIComponent(value('visionUrl'))
             + '&question=' + encodeURIComponent(value('visionQuestion'))),
+        metrics: (s) => call(s, '/api/ai/metrics/summary'),
         stream: (s) => startStream(s),
         streamStop: () => stopStream()
     };
+
+    // The agent answers with a step trace, not just prose: draw each tool call/result and the final answer.
+    function renderAgentTrace(section, payload) {
+        if (!payload || !Array.isArray(payload.steps)) return;
+        const box = section.querySelector('.cites') || appendCitesBox(section);
+        box.innerHTML = '';
+        const header = document.createElement('div');
+        header.className = 'note';
+        header.textContent = payload.modelCalls + ' model calls · ' + payload.toolCalls + ' tool calls'
+            + (payload.budgetExhausted ? ' · step budget reached' : '');
+        box.appendChild(header);
+        payload.steps.forEach((step) => {
+            const label = step.phase === 'tool_call' ? 'call ' + step.name
+                : step.phase === 'tool_result' ? 'result ' + step.name
+                : 'answer';
+            const row = document.createElement('div');
+            row.className = 'turn';
+            row.innerHTML = '<span>step ' + escapeHtml(step.step) + ' · ' + escapeHtml(label) + '</span><br>'
+                + escapeHtml(step.detail);
+            box.appendChild(row);
+        });
+    }
 
     // Streaming is only wired for the assistant mode; the others are single-shot tool calls.
     function startToolStream(section) {

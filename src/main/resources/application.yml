@@ -73,6 +73,22 @@ app:
     # sharing chat's. Started by start-offline-llm.sh (second llama-server on 8082).
     base-url: ${OPENAI_EMBEDDING_BASE_URL:http://localhost:8082}
     model: ${OPENAI_EMBEDDING_MODEL:all-minilm}
+  cache:
+    # A question semantically identical to one already answered is replayed from a vector index of prior
+    # questions, skipping the model entirely. Turn off to make every request reach the model.
+    enabled: ${SEMANTIC_CACHE_ENABLED:true}
+    # all-minilm cosine between two phrasings of the same question sits around 0.8-0.95; a lower floor would
+    # start serving the answer to a different question, which is worse than a miss.
+    similarity-threshold: 0.95
+    # Bounded so a long-running process cannot grow without limit; the oldest entry is evicted first.
+    max-entries: 200
+    ttl: PT30M
+  agent:
+    # /api/ai/tools/agent alternates model calls and tool execution, and this is the ceiling on those rounds:
+    # a model that keeps asking for tools is stopped here rather than looping until the read timeout.
+    max-steps: ${AGENT_MAX_STEPS:6}
+    # The toolbox the loop may call. Removing a name here is enough to withdraw a tool from the agent.
+    tools: getCurrentWeather,getOrderStatus,calculate,getCurrentDateTime,searchKnowledgeBase
   guardrails:
     # Redact PII from model output before it leaves the API. Turn off to see raw completions while debugging.
     redact-output: ${GUARDRAILS_REDACT_OUTPUT:true}
@@ -87,6 +103,17 @@ app:
     # cutoff above ~0.4 silently drops the context and the model answers from memory.
     similarity-threshold: 0.2
     top-k: 4
+    hybrid:
+      # Retrieval fuses the vector ranking with a BM25 keyword ranking, which is what recovers a chunk that
+      # matches on a rare literal term (an acronym) but scores poorly as an embedding. Off reverts to pure
+      # vector search.
+      enabled: ${RAG_HYBRID_ENABLED:true}
+      # Vector candidates pulled before fusion; widened to at least the corpus size so a keyword-matched chunk
+      # also has a cosine to report.
+      candidate-pool: 50
+      # Reciprocal-rank-fusion constant: the rank offset that lets a cosine ranking and a BM25 ranking be
+      # merged without calibrating their different score scales.
+      rrf-k: 60
     follow-up:
       # Rewrites "and what about travel?" into a standalone question before the retrieval advisor sees it, and
       # stores RAG turns in the same chat memory so the next follow-up has an antecedent. Costs one extra model

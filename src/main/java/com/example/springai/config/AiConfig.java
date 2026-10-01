@@ -1,6 +1,10 @@
 package com.example.springai.config;
 
 import com.example.springai.advisor.TokenUsageAdvisor;
+import com.example.springai.cache.SemanticCacheAdvisor;
+import com.example.springai.observability.AiMetrics;
+import com.example.springai.vectorstore.HybridVectorStore;
+import com.example.springai.vectorstore.KeywordIndex;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.client.ChatClientCustomizer;
 import org.springframework.ai.chat.client.advisor.MessageChatMemoryAdvisor;
@@ -14,11 +18,14 @@ import org.springframework.ai.openai.OpenAiEmbeddingModel;
 import org.springframework.ai.openai.OpenAiEmbeddingOptions;
 import org.springframework.ai.openai.api.OpenAiApi;
 import org.springframework.ai.vectorstore.SimpleVectorStore;
+import org.springframework.ai.vectorstore.VectorStore;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Primary;
+
+import java.time.Duration;
 
 @Configuration
 public class AiConfig {
@@ -44,8 +51,8 @@ public class AiConfig {
      * (RAG) report usage too instead of each one re-declaring the advisor.
      */
     @Bean
-    public ChatClientCustomizer tokenUsageAdvisorCustomizer() {
-        return builder -> builder.defaultAdvisors(new TokenUsageAdvisor());
+    public ChatClientCustomizer tokenUsageAdvisorCustomizer(AiMetrics aiMetrics) {
+        return builder -> builder.defaultAdvisors(new TokenUsageAdvisor(aiMetrics));
     }
 
     /**
@@ -55,8 +62,30 @@ public class AiConfig {
      * since Spring AI 1.1.6 the advisor rejects a call that supplies no conversation id.
      */
     @Bean
-    public ChatClient chatClient(ChatClient.Builder builder) {
-        return builder.defaultSystem(SYSTEM_PROMPT).build();
+    public ChatClient chatClient(ChatClient.Builder builder, SemanticCacheAdvisor semanticCacheAdvisor) {
+        return builder.defaultSystem(SYSTEM_PROMPT)
+                .defaultAdvisors(semanticCacheAdvisor)
+                .build();
+    }
+
+    /**
+     * Replays an answer to a semantically identical question instead of generating it again.
+     *
+     * <p>Attached to {@code chatClient} alone. The memory client's answer depends on history the cache key
+     * deliberately ignores, the rewriter must not be handed a stale standalone question, and a RAG answer
+     * goes stale the moment a document is uploaded — so none of those are cached. Within this client, a
+     * request that carries tools, an output schema, an image or a conversation id also falls straight
+     * through; only a plain text question is cached.
+     */
+    @Bean
+    public SemanticCacheAdvisor semanticCacheAdvisor(
+            EmbeddingModel embeddingModel,
+            AiMetrics aiMetrics,
+            @Value("${app.cache.enabled:true}") boolean enabled,
+            @Value("${app.cache.similarity-threshold:0.95}") double similarityThreshold,
+            @Value("${app.cache.max-entries:200}") int maxEntries,
+            @Value("${app.cache.ttl:PT30M}") Duration ttl) {
+        return new SemanticCacheAdvisor(embeddingModel, enabled, similarityThreshold, maxEntries, ttl, aiMetrics);
     }
 
     @Bean
@@ -123,5 +152,23 @@ public class AiConfig {
     @Bean
     public SimpleVectorStore vectorStore(EmbeddingModel embeddingModel) {
         return SimpleVectorStore.builder(embeddingModel).build();
+    }
+
+    /**
+     * The store every retriever actually talks to: the vector store with a BM25 keyword leg fused into its
+     * ranking, so an acronym a cosine model cannot represent is still recovered by its literal term.
+     *
+     * <p>{@code @Primary} so {@code VectorStore} injection points (the QA advisor, {@code /rag/search}, the
+     * knowledge-base tool) receive the hybrid, while the couple of callers that need the raw store — snapshot
+     * save/load, the boot enumeration — still ask for the concrete {@link SimpleVectorStore}.
+     */
+    @Bean
+    @Primary
+    public VectorStore hybridVectorStore(SimpleVectorStore vectorStore,
+                                         KeywordIndex keywordIndex,
+                                         @Value("${app.rag.hybrid.enabled:true}") boolean enabled,
+                                         @Value("${app.rag.hybrid.candidate-pool:50}") int candidatePool,
+                                         @Value("${app.rag.hybrid.rrf-k:60}") int rrfK) {
+        return new HybridVectorStore(vectorStore, keywordIndex, enabled, candidatePool, rrfK);
     }
 }

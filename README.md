@@ -120,6 +120,10 @@ runs. `TokenUsageAdvisor` uses `LOWEST_PRECEDENCE - 1` for that reason — see
 | **Structured output** | [`StructuredOutputController.java`](src/main/java/com/example/springai/controller/StructuredOutputController.java) | `responseEntity(...)` parses into the record and keeps the raw completion; a flat answer shape is restated after the schema, an incomplete record retries once, then `422` with `rawModelOutput`. |
 | **Multimodal vision** | [`MultimodalController.java`](src/main/java/com/example/springai/controller/MultimodalController.java) | Server-side download with a `User-Agent`, address-class screening, `Media` attachment on the prompt. |
 | **Resilience & ops** | [`AiConcurrencyLimitFilter`](src/main/java/com/example/springai/config/AiConcurrencyLimitFilter.java), [`LlmHealthIndicator`](src/main/java/com/example/springai/health/LlmHealthIndicator.java), [`GlobalExceptionHandler`](src/main/java/com/example/springai/error/GlobalExceptionHandler.java) | HTTP timeouts, a cached live probe, a semaphore ceiling with `Retry-After`, and typed error bodies instead of container stack dumps. |
+| **Semantic response cache** | [`SemanticCacheAdvisor.java`](src/main/java/com/example/springai/cache/SemanticCacheAdvisor.java) | The outermost advisor: a paraphrase of a question already answered is replayed from a vector index of prior questions without calling the model, short-circuiting the whole chain (memory, model, token logging). Requests whose answer depends on more than the prompt text — a tool, a conversation, an image, a structured schema — fall straight through. Tunable via `app.cache.*` / `SEMANTIC_CACHE_ENABLED`. |
+| **Hybrid retrieval (BM25 + vector)** | [`HybridVectorStore.java`](src/main/java/com/example/springai/vectorstore/HybridVectorStore.java), [`KeywordIndex.java`](src/main/java/com/example/springai/vectorstore/KeywordIndex.java) | A `@Primary` `VectorStore` decorator that fuses the cosine ranking with a BM25 keyword ranking by reciprocal rank fusion, recovering a chunk that matches on a rare literal term (an acronym) but scores poorly as an embedding. Every caller (`QuestionAnswerAdvisor`, `/rag/search`, the knowledge-base tool) gets it for free; off via `RAG_HYBRID_ENABLED=false`. |
+| **Agentic multi-step loop** | [`AgenticLoopService.java`](src/main/java/com/example/springai/agent/AgenticLoopService.java) | `GET /api/ai/tools/agent` drives the tool-calling loop by hand — model call, `ToolCallingManager.executeToolCalls`, repeat — bounded by `app.agent.max-steps`, and returns the full ordered step trace. Hand-rolled rather than delegated to Spring AI's internal loop so each round is visible. |
+| **Observability & cost** | [`AiMetrics.java`](src/main/java/com/example/springai/observability/AiMetrics.java), [`AiRequestMetricsFilter.java`](src/main/java/com/example/springai/config/AiRequestMetricsFilter.java), [`MetricsController.java`](src/main/java/com/example/springai/controller/MetricsController.java) | A servlet filter folds every `/api/ai` call into requests / tokens / cache hit-rate / latency percentiles, rendered at `GET /api/ai/metrics/summary` and also exported as Micrometer counters (`ai.requests.total`, `ai.tokens.total`, `ai.latency`, `ai.cache.requests.total`). |
 | **Docs & demo UI** | [`OpenApiConfig.java`](src/main/java/com/example/springai/config/OpenApiConfig.java), [`index.html`](src/main/resources/static/index.html) | springdoc 2.8.17 (2.8.x is the Boot 3 line) and a dependency-free static page. |
 
 ---
@@ -133,7 +137,7 @@ runs. `TokenUsageAdvisor` uses `LOWEST_PRECEDENCE - 1` for that reason — see
 | **Failure contract** | `ResourceAccessException` / `TransientAiException` → `503` + `Retry-After: 5`; `NonTransientAiException` → `502`; blank or over-long parameters → `400`; unparseable model output → `422`; oversized upload → `413`. Every body carries `error`, `status`, `detail`, `requestId`. | — |
 | **Concurrency ceiling** | A `Semaphore` caps simultaneous model calls at **4**; extra `/api/ai/**` requests are refused immediately with `503` + `Retry-After: 2` rather than queueing unseen. Streaming calls release their permit on `AsyncContext` completion, not when the filter returns. | `app.ai.max-concurrent-requests` |
 | **LLM health** | `HealthIndicator` named `llm` sends a one-token prompt and reports `model`, `reply`, `latencyMs`, `probedAt` (or `error`/`cause` when DOWN). Results are cached so a load balancer polling health cannot itself become the dominant load on the model. | `app.health.llm.cache-ttl` (30s) |
-| **Metrics** | `/actuator/metrics` exposes `gen_ai.client.token.usage`, `gen_ai.client.operation`, `gen_ai.client.operation.active` and the `app.ai.inflight` gauge. | `management.endpoints.web.exposure.include` |
+| **Metrics** | `/actuator/metrics` exposes `gen_ai.client.token.usage`, `gen_ai.client.operation`, `gen_ai.client.operation.active` and the `app.ai.inflight` gauge. The demo-facing roll-up — requests, tokens, cache hit rate, latency p50/p95 — is `GET /api/ai/metrics/summary`. | `management.endpoints.web.exposure.include` |
 | **Request logging** | `logs/endpoints.log` — one line per call with `requestId`; `logs/app.log` — the full log, same `requestId`. Docs, actuator and static assets are skipped so the multi-megabyte OpenAPI document does not drown the AI traffic. | `logging.level.ENDPOINT_ACCESS` |
 
 ---
@@ -159,9 +163,11 @@ grep -oE "resp=\{.{0,160}" logs/endpoints.log  # structured payloads
 
 `http://localhost:8080/` is a single dependency-free file
 ([`src/main/resources/static/index.html`](src/main/resources/static/index.html)) — no build step, no framework.
-Ten panels, one per capability: chat, templated prompt, streaming, chat memory (with **history** and **clear**
-buttons that read/write the H2 store), tool calling, structured output, RAG query, vector search, document
-upload and image analysis.
+Eleven panels, one per capability: chat, templated prompt, streaming, chat memory (with **history** and **clear**
+buttons that read/write the H2 store), tool calling (weather, order, multi, calculator, date/time, and the
+`assistant` mode that exposes every tool plus the knowledge base), structured output, RAG query, vector search,
+document upload, image analysis, and a **usage metrics** panel that renders `/api/ai/metrics/summary`. The
+tool-calling panel also runs the agentic loop and draws its step trace; the assistant mode streams.
 
 Every result panel shows the answer, the raw JSON body, and the status line `HTTP <code> · requestId <X-Request-Id>`,
 so a failure can be taken straight to `grep <requestId> logs/app.log`. Streaming uses `EventSource`, which is the
@@ -481,12 +487,38 @@ Pick the URL yourself — the endpoint takes no default asset. Requirements, lea
 - **Public internet addresses only.** The server fetches the caller's URL, so it refuses loopback, private,
   link-local and cloud-metadata ranges with `400 image_unavailable`.
 
+### 9. Agentic multi-step loop
+The model alternates between asking for a tool and reading its result until it answers — driven by
+`AgenticLoopService` rather than Spring AI's internal loop, so every round is a visible step.
+
+```bash
+curl "http://localhost:8080/api/ai/tools/agent?prompt=How+many+days+of+annual+leave+do+I+get,+and+what+is+3+times+that+number?"
+```
+
+The response carries the final `answer` plus the ordered `steps` (each tool call with its arguments, and each
+result), `modelCalls`, `toolCalls`, and `budgetExhausted` — true when `app.agent.max-steps` was reached and the
+model was finally asked to answer without tools. The toolbox is `app.agent.tools`; naming a tool there is the
+only thing that advertises it to the loop.
+
+### 10. Usage metrics
+One JSON object for the demo page, so what the process has served can be read without a metrics stack.
+
+```bash
+curl "http://localhost:8080/api/ai/metrics/summary"
+```
+
+It reports `requests` (total, errors, per-endpoint), `tokens` (prompt / completion / total), `cache`
+(hits, misses, hitRate — the semantic-cache hit rate, counted where the lookup happens rather than inferred
+from token deltas) and `latencyMs` (p50 / p95 / max / average over the last 512 calls). The same series are
+exported to `/actuator/metrics` as `ai.requests.total`, `ai.tokens.total`, `ai.latency` and
+`ai.cache.requests.total`.
+
 ---
 
 ## 🛠 Build, test, package
 
 ```bash
-mvn -B test              # 59 tests — 57 run offline, 2 skipped, no model calls: standalone MockMvc +
+mvn -B test              # 101 tests — 98 run offline, 3 skipped, no model calls: standalone MockMvc +
                          # proxy-faked ChatClient, a stub embedder for the RAG store, @TempDir for the
                          # persistence tests
 mvn -B test -Dapp.rag.eval=true   # runs the skipped ones too: the golden questions and the follow-ups

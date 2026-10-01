@@ -1,5 +1,6 @@
 package com.example.springai.advisor;
 
+import com.example.springai.observability.AiMetrics;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.client.ChatClientRequest;
@@ -10,7 +11,8 @@ import org.springframework.ai.chat.metadata.Usage;
 import org.springframework.core.Ordered;
 
 /**
- * Writes one token-usage line per completion.
+ * Writes one token-usage line per completion, and folds the same numbers into {@link AiMetrics} so the
+ * dashboard does not have to parse the log.
  * <p>
  * Spring AI already counts tokens into the {@code gen_ai.client.token.usage} counter, but a counter cannot
  * answer what a specific request cost; this line carries the same MDC requestId as logs/endpoints.log, so a
@@ -25,6 +27,12 @@ public class TokenUsageAdvisor implements BaseAdvisor {
     // is inserted last, so an advisor that also claims LOWEST_PRECEDENCE sorts behind it and is never
     // popped off the chain. Staying one step ahead of that value is what makes this advisor run.
     private static final int ORDER = Ordered.LOWEST_PRECEDENCE - 1;
+
+    private final AiMetrics aiMetrics;
+
+    public TokenUsageAdvisor(AiMetrics aiMetrics) {
+        this.aiMetrics = aiMetrics;
+    }
 
     @Override
     public String getName() {
@@ -50,6 +58,7 @@ public class TokenUsageAdvisor implements BaseAdvisor {
         if (total != null && total != 0) {
             log.info("tokens prompt={} completion={} total={}",
                     usage.getPromptTokens(), usage.getCompletionTokens(), total);
+            aiMetrics.recordTokens(usage.getPromptTokens(), usage.getCompletionTokens());
         }
         return response;
     }

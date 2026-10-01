@@ -413,7 +413,7 @@ upload → 1 chunk → restart → 3 chunks.
 ## 9. How to test
 
 ```bash
-mvn -B test                              # 59 tests: 57 run offline, 2 skipped
+mvn -B test                              # 101 tests: 98 run offline, 3 skipped
 mvn -B test -Dapp.rag.eval=true          # + the two live tier-2 tables (golden questions, follow-ups)
 ```
 
@@ -481,3 +481,67 @@ the other two already ranked 1 unresolved, which is a result you do not want a g
 
 **What still needs a real model:** grounded RAG *answers*, token log lines, tool execution, SSE incremental
 delivery, health DOWN with no backend. See `README.md`.
+
+---
+
+## 10. Cache, hybrid retrieval, the agent loop and metrics
+
+### [`SemanticCacheAdvisor.java`](src/main/java/com/example/springai/cache/SemanticCacheAdvisor.java)
+
+A `CallAdvisor` at `HIGHEST_PRECEDENCE + 10` — the outermost, ahead of the terminal advisor, because a hit has
+to *short-circuit*: returning a response without calling `chain.nextCall` is what skips the memory advisor, the
+model and `TokenUsageAdvisor` together. A miss wraps the whole chain, so the answer it stores is the one the
+caller actually got.
+
+The store is its own `SimpleVectorStore`, deliberately not the knowledge base: a cached answer is keyed by a
+question and must never surface as a retrieved document in a RAG citation. A lookup is a vector search over
+prior questions, so a paraphrase hits, not just a repeated string.
+
+Two things are load-bearing. First, several requests are never cached — a tool call (side effects, fresh data),
+a conversation turn (history the key ignores), an image (not in the text), a structured output (a schema the
+cached plain text cannot satisfy) — each excluded in `cacheableKeyOf` rather than cached wrongly. Second, the
+stored `Document` gets a `ContentFormatter` that returns only its text. `SimpleVectorStore.doAdd` embeds a
+document through `OpenAiEmbeddingModel.embed(Document)` → `getFormattedContent(MetadataMode.EMBED)`, which folds
+the metadata in, while `doSimilaritySearch` embeds the bare query string. Left alone, a question is stored as
+"question + answer + timestamp" and can never match itself at the 0.95 floor; formatting the stored key to its
+text alone puts both sides on the same footing. `SemanticCacheAdvisorTest` models that asymmetry with a
+`MetadataInclusiveEmbeddingModel`, which is why the test fails if the formatter is removed.
+
+Config: `app.cache.enabled`, `similarity-threshold` (0.95), `max-entries` (200, FIFO eviction), `ttl` (PT30M).
+
+### [`HybridVectorStore.java`](src/main/java/com/example/springai/vectorstore/HybridVectorStore.java) / [`KeywordIndex.java`](src/main/java/com/example/springai/vectorstore/KeywordIndex.java)
+
+A `@Primary` decorator, not a replacement: it implements `VectorStore`, so every caller — the
+`QuestionAnswerAdvisor`, `/rag/search`, `KnowledgeBaseToolService` — gets hybrid retrieval without knowing it
+is talking to a decorator. The vector leg remains the source of truth for a chunk's reported `score` (its
+cosine); the decorator only changes *order* and *membership*.
+
+The two ranked lists are merged by reciprocal rank fusion (`rrf-k`), which needs no calibration between a
+cosine and a BM25 number. A document is eligible if the vector leg ranked it at or above the threshold **or**
+the keyword leg matched a query term — the union is what recovers the acronym chunk the cosine floor drops. The
+corpus is small, so the vector leg runs over a pool at least as wide as the index, meaning a keyword-only
+document still usually carries a real cosine to report. `rebuildKeywordIndex()` repopulates the BM25 leg after
+`RagStorePersistence` restores chunks straight into the inner store, bypassing this decorator's `add`.
+
+### [`AgenticLoopService.java`](src/main/java/com/example/springai/agent/AgenticLoopService.java)
+
+`GET /api/ai/tools/agent` runs the loop itself instead of delegating to Spring AI's internal tool execution:
+`ChatModel.call`, and while the response has tool calls, `ToolCallingManager.executeToolCalls(prompt, response)`
+and repeat, with `internalToolExecutionEnabled(false)` on the options so the framework does not also run them.
+Bounding the rounds in `app.agent.max-steps` is what stops a model that will not stop asking for tools; on
+exhaustion the service nudges once with the tools withdrawn (`answerWithoutTools`) so the caller gets prose
+rather than an error. The run returns an ordered `Step` list (each `tool_call` and `tool_result`), `modelCalls`,
+`toolCalls` and `budgetExhausted`, and the final answer is PII-redacted like any other. The toolbox is
+`app.agent.tools`, so withdrawing a tool from the loop is a config change, not a code change.
+
+### [`AiMetrics.java`](src/main/java/com/example/springai/observability/AiMetrics.java) / [`AiRequestMetricsFilter.java`](src/main/java/com/example/springai/config/AiRequestMetricsFilter.java) / [`MetricsController.java`](src/main/java/com/example/springai/controller/MetricsController.java)
+
+`AiRequestMetricsFilter` (order `HIGHEST_PRECEDENCE + 300`, *inside* `AiConcurrencyLimitFilter`, so a 503 the
+filter refuses is not counted as a served call) times every `/api/ai` request and folds it into `AiMetrics`.
+The Micrometer instruments (`ai.requests.total`, `ai.tokens.total`, `ai.latency`, `ai.cache.requests.total`) are
+the durable record; the in-process counters exist because a Micrometer counter cannot be enumerated back into a
+per-endpoint table, and that table is exactly what `MetricsController` renders at `GET /api/ai/metrics/summary`.
+Percentiles come from a bounded ring of the last 512 latencies — a real histogram would be more machinery than
+the showcase needs. A streamed call is measured down to the point the request goes async (time to first byte),
+not the end of the generation.
+

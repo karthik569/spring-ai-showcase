@@ -1,5 +1,6 @@
 package com.example.springai.controller;
 
+import com.example.springai.agent.AgenticLoopService;
 import com.example.springai.guardrail.PiiRedactor;
 import com.example.springai.support.ConversationIds;
 import org.slf4j.Logger;
@@ -34,13 +35,16 @@ public class ToolCallingController {
     private final ChatClient chatClient;
     private final ChatClient conversationalChatClient;
     private final PiiRedactor piiRedactor;
+    private final AgenticLoopService agenticLoopService;
 
     public ToolCallingController(ChatClient chatClient,
                                  @Qualifier("conversationalChatClient") ChatClient conversationalChatClient,
-                                 PiiRedactor piiRedactor) {
+                                 PiiRedactor piiRedactor,
+                                 AgenticLoopService agenticLoopService) {
         this.chatClient = chatClient;
         this.conversationalChatClient = conversationalChatClient;
         this.piiRedactor = piiRedactor;
+        this.agenticLoopService = agenticLoopService;
     }
 
     @GetMapping("/weather")
@@ -136,6 +140,17 @@ public class ToolCallingController {
         Map<String, String> response = answered(prompt, answer);
         return conversation == null ? response
                 : Map.of("conversationId", conversation, "prompt", prompt, "response", response.get("response"));
+    }
+
+    /**
+     * The same toolbox, but driven by {@link AgenticLoopService} instead of the one-shot call: the model may
+     * call tools across several rounds, and the response carries the step trace plus how much budget it spent.
+     * Bounded by {@code app.agent.max-steps}, so a model that never stops asking for tools still terminates.
+     */
+    @GetMapping("/agent")
+    public AgenticLoopService.AgentRun agent(
+            @RequestParam(defaultValue = "How many days of annual leave do I get, and what is 3 times that number?") String prompt) {
+        return agenticLoopService.run(prompt);
     }
 
     /**

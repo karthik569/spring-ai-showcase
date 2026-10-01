@@ -98,8 +98,9 @@ class ControllerIntegrationTest {
     @Test
     void testToolCallingControllerStandalone() throws Exception {
         ChatClient fakeChatClient = createFakeChatClient("The weather in Tokyo is 18.5°C and partly cloudy.");
+        // The /weather endpoint never reaches the agent loop, so the loop is not exercised here.
         ToolCallingController controller = new ToolCallingController(fakeChatClient, fakeChatClient,
-                new PiiRedactor(true));
+                new PiiRedactor(true), null);
         MockMvc mockMvc = MockMvcBuilders.standaloneSetup(controller).build();
 
         mockMvc.perform(get("/api/ai/tools/weather")
