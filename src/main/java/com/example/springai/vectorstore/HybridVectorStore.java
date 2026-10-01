@@ -33,7 +33,7 @@ import java.util.function.Predicate;
  * keyword-only document normally still carries a real cosine; only a chunk beyond the pool cap would report
  * a null score.
  */
-public class HybridVectorStore implements VectorStore {
+public class HybridVectorStore implements VectorStore, KeywordLegRebuildable {
 
     private static final Logger log = LoggerFactory.getLogger(HybridVectorStore.class);
 

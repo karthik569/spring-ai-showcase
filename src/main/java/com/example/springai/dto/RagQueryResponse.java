@@ -15,6 +15,10 @@ import java.util.List;
  *                      check rather than a claim in a README
  * @param answer the model's reply
  * @param sourceDocuments the chunks the advisor actually injected, taken from its own retrieval context
+ * @param groundingOutcome whether the knowledge base covered the question — {@code GROUNDED} (the retrieved
+ *                         chunks answer it), {@code RE_QUERIED} (only after dropping the rewrite and the
+ *                         filename filter), {@code REFUSED} (nothing relevant; {@code answer} is a refusal
+ *                         and the model was not asked), or {@code DISABLED} (the gate is off)
  * @param responseTimeMs wall time for the whole request, resolution included
  */
 public record RagQueryResponse(
@@ -25,5 +29,6 @@ public record RagQueryResponse(
         long rewriteTimeMs,
         String answer,
         List<RetrievedChunk> sourceDocuments,
+        String groundingOutcome,
         long responseTimeMs
 ) {}

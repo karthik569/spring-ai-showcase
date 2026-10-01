@@ -2,9 +2,17 @@ package com.example.springai.config;
 
 import com.example.springai.advisor.TokenUsageAdvisor;
 import com.example.springai.cache.SemanticCacheAdvisor;
+import com.example.springai.guardrail.PiiRedactor;
+import com.example.springai.memory.SummarizingChatMemory;
 import com.example.springai.observability.AiMetrics;
+import com.example.springai.rag.ContextGrader;
+import com.example.springai.rag.LlmContextGrader;
+import com.example.springai.rag.LlmReranker;
+import com.example.springai.rag.RagCoverageGate;
+import com.example.springai.rag.Reranker;
 import com.example.springai.vectorstore.HybridVectorStore;
 import com.example.springai.vectorstore.KeywordIndex;
+import com.example.springai.vectorstore.RerankingVectorStore;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.client.ChatClientCustomizer;
 import org.springframework.ai.chat.client.advisor.MessageChatMemoryAdvisor;
@@ -33,16 +41,53 @@ public class AiConfig {
     private static final String SYSTEM_PROMPT =
             "You are an expert AI assistant powered by Spring AI. You provide clear, accurate, and structured responses.";
 
-    // A window, not the whole transcript: the local model's context is small enough that an unbounded
-    // history pushes the actual question out of the prompt.
+    // The window used when summarization is off. It is small because the local model's context is: an
+    // unbounded history pushes the actual question out of the prompt. When summarization is on the window
+    // becomes an upper bound only, and the summarizer — not the trim — is what keeps the prompt short.
     private static final int MEMORY_WINDOW_MESSAGES = 6;
 
-    // The repository is auto-configured (JDBC backed by H2) and owns the schema; this only bounds the window.
+    /**
+     * The repository is auto-configured (JDBC backed by H2) and owns the schema. With summarization on, the
+     * window is widened and wrapped in a {@link SummarizingChatMemory} that folds the oldest turns into one
+     * summary message once the stored history passes the trigger, so a long conversation keeps its thread
+     * instead of dropping its opening. {@code MessageChatMemoryAdvisor} is untouched: it still consumes a
+     * plain {@link ChatMemory}.
+     */
     @Bean
-    public ChatMemory chatMemory(ChatMemoryRepository chatMemoryRepository) {
-        return MessageWindowChatMemory.builder()
+    public ChatMemory chatMemory(ChatMemoryRepository chatMemoryRepository,
+                                 @Qualifier("conversationSummarizer") ChatClient conversationSummarizer,
+                                 PiiRedactor piiRedactor,
+                                 @Value("${app.memory.summarization.enabled:true}") boolean summarize,
+                                 @Value("${app.memory.summarization.trigger-messages:8}") int triggerMessages,
+                                 @Value("${app.memory.summarization.keep-recent-messages:4}") int keepRecent,
+                                 @Value("${app.memory.summarization.max-window-messages:30}") int maxWindow,
+                                 @Value("${app.memory.summarization.max-summary-chars:400}") int maxSummaryChars) {
+        ChatMemory window = MessageWindowChatMemory.builder()
                 .chatMemoryRepository(chatMemoryRepository)
-                .maxMessages(MEMORY_WINDOW_MESSAGES)
+                .maxMessages(summarize ? Math.max(maxWindow, triggerMessages + 1) : MEMORY_WINDOW_MESSAGES)
+                .build();
+        if (!summarize) {
+            return window;
+        }
+        return new SummarizingChatMemory(window, conversationSummarizer, piiRedactor,
+                triggerMessages, keepRecent, maxSummaryChars);
+    }
+
+    /**
+     * Folds older turns into one summary message for {@link #chatMemory} when the window overflows.
+     *
+     * <p>A separate bean for the same reason as {@link #ragQueryRewriter}: {@code defaultAdvisors} accumulates,
+     * so a client built from a builder that already carries the memory advisor would recurse through the very
+     * memory it is compacting. Temperature 0 and a small output cap because this is compression, not
+     * composition.
+     */
+    @Bean
+    @Qualifier("conversationSummarizer")
+    public ChatClient conversationSummarizer(ChatClient.Builder builder) {
+        return builder
+                .defaultSystem("You summarize an earlier conversation in a few sentences. Keep names, numbers,"
+                        + " decisions and any preferences the user stated. Answer with the summary only.")
+                .defaultOptions(OpenAiChatOptions.builder().temperature(0.0).maxTokens(256).build())
                 .build();
     }
 
@@ -155,20 +200,89 @@ public class AiConfig {
     }
 
     /**
-     * The store every retriever actually talks to: the vector store with a BM25 keyword leg fused into its
-     * ranking, so an acronym a cosine model cannot represent is still recovered by its literal term.
+     * The store that fuses a BM25 keyword ranking into the vector ranking, so an acronym a cosine model
+     * cannot represent is still recovered by its literal term.
      *
-     * <p>{@code @Primary} so {@code VectorStore} injection points (the QA advisor, {@code /rag/search}, the
-     * knowledge-base tool) receive the hybrid, while the couple of callers that need the raw store — snapshot
-     * save/load, the boot enumeration — still ask for the concrete {@link SimpleVectorStore}.
+     * <p>Exposed as the concrete type, not the primary {@code VectorStore}: callers that need {@code
+     * rebuildKeywordIndex} (the boot ingestion runner, through {@link
+     * com.example.springai.vectorstore.KeywordLegRebuildable}) and the CRAG coverage gate, which wants the
+     * fused ranking without the re-ranker's extra model call, both ask for it directly.
+     */
+    @Bean
+    public HybridVectorStore hybridVectorStore(SimpleVectorStore vectorStore,
+                                               KeywordIndex keywordIndex,
+                                               @Value("${app.rag.hybrid.enabled:true}") boolean enabled,
+                                               @Value("${app.rag.hybrid.candidate-pool:50}") int candidatePool,
+                                               @Value("${app.rag.hybrid.rrf-k:60}") int rrfK) {
+        return new HybridVectorStore(vectorStore, keywordIndex, enabled, candidatePool, rrfK);
+    }
+
+    /**
+     * The {@code VectorStore} every retriever actually receives: the hybrid store with an optional LLM
+     * re-rank pass over its fused result. {@code @Primary} so the QA advisor, {@code /rag/search} and the
+     * knowledge-base tool all get it without naming it. Off by default — see {@code app.rag.rerank.enabled}.
      */
     @Bean
     @Primary
-    public VectorStore hybridVectorStore(SimpleVectorStore vectorStore,
-                                         KeywordIndex keywordIndex,
-                                         @Value("${app.rag.hybrid.enabled:true}") boolean enabled,
-                                         @Value("${app.rag.hybrid.candidate-pool:50}") int candidatePool,
-                                         @Value("${app.rag.hybrid.rrf-k:60}") int rrfK) {
-        return new HybridVectorStore(vectorStore, keywordIndex, enabled, candidatePool, rrfK);
+    public VectorStore rerankingVectorStore(HybridVectorStore hybridVectorStore,
+                                            Reranker reranker,
+                                            @Value("${app.rag.rerank.enabled:false}") boolean enabled,
+                                            @Value("${app.rag.rerank.candidates:12}") int candidates) {
+        return new RerankingVectorStore(hybridVectorStore, reranker, enabled, candidates);
+    }
+
+    /**
+     * Orders a fused result list by relevance. A separate bean so it is the shipped {@link LlmReranker}
+     * behind the interface, and the retrieval tests can substitute a deterministic one.
+     */
+    @Bean
+    public Reranker reranker(@Qualifier("ragReranker") ChatClient ragReranker,
+                             @Value("${app.rag.rerank.max-excerpt-chars:200}") int maxExcerptChars) {
+        return new LlmReranker(ragReranker, maxExcerptChars);
+    }
+
+    /**
+     * The re-ranker's client. Single-digit output and temperature 0 because this is a ranking, not a
+     * composition; a separate bean so the default advisors do not accumulate onto the RAG builder.
+     */
+    @Bean
+    @Qualifier("ragReranker")
+    public ChatClient ragReranker(ChatClient.Builder builder) {
+        return builder
+                .defaultSystem("You rank passages by how well they answer a question. Answer with numbers only.")
+                .defaultOptions(OpenAiChatOptions.builder().temperature(0.0).maxTokens(32).build())
+                .build();
+    }
+
+    /**
+     * Judges whether retrieved chunks can answer the question. Separate from {@link #reranker} because it
+     * may reply "none", which the re-ranker may not.
+     */
+    @Bean
+    public ContextGrader contextGrader(@Qualifier("ragGrader") ChatClient ragGrader,
+                                       @Value("${app.rag.crag.max-excerpt-chars:200}") int maxExcerptChars) {
+        return new LlmContextGrader(ragGrader, maxExcerptChars);
+    }
+
+    @Bean
+    @Qualifier("ragGrader")
+    public ChatClient ragGrader(ChatClient.Builder builder) {
+        return builder
+                .defaultSystem("You decide which passages could answer a question. Answer with numbers only, or NONE.")
+                .defaultOptions(OpenAiChatOptions.builder().temperature(0.0).maxTokens(32).build())
+                .build();
+    }
+
+    /**
+     * The pre-answer coverage gate for the RAG path. Built over the concrete {@link HybridVectorStore} so its
+     * retrieval reflects fusion and does not pay the re-ranker's model call.
+     */
+    @Bean
+    public RagCoverageGate ragCoverageGate(HybridVectorStore hybridVectorStore,
+                                           ContextGrader contextGrader,
+                                           @Value("${app.rag.crag.enabled:true}") boolean enabled,
+                                           @Value("${app.rag.crag.candidates:6}") int candidates,
+                                           @Value("${app.rag.crag.min-relevant:1}") int minRelevant) {
+        return new RagCoverageGate(hybridVectorStore, contextGrader, enabled, candidates, minRelevant);
     }
 }

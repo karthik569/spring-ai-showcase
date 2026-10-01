@@ -5,6 +5,7 @@ import com.example.springai.dto.RagQueryResponse;
 import com.example.springai.dto.RetrievedChunk;
 import com.example.springai.guardrail.PiiRedactor;
 import com.example.springai.guardrail.PromptInjectionDetector;
+import com.example.springai.rag.RagCoverageGate;
 import com.example.springai.service.RagDocumentIngestionService;
 import com.example.springai.service.RagQueryResolver;
 import jakarta.validation.Valid;
@@ -28,6 +29,7 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.regex.Pattern;
 
@@ -49,6 +51,7 @@ public class RagController {
     private final VectorStore vectorStore;
     private final RagDocumentIngestionService ingestionService;
     private final RagQueryResolver queryResolver;
+    private final RagCoverageGate coverageGate;
     private final PiiRedactor piiRedactor;
     private final PromptInjectionDetector injectionDetector;
     private final boolean blockInjectionOnIngest;
@@ -58,6 +61,7 @@ public class RagController {
                          VectorStore vectorStore,
                          RagDocumentIngestionService ingestionService,
                          RagQueryResolver queryResolver,
+                         RagCoverageGate coverageGate,
                          PiiRedactor piiRedactor,
                          PromptInjectionDetector injectionDetector,
                          @Value("${app.guardrails.block-injection-on-ingest:true}") boolean blockInjectionOnIngest,
@@ -66,6 +70,7 @@ public class RagController {
         this.vectorStore = vectorStore;
         this.ingestionService = ingestionService;
         this.queryResolver = queryResolver;
+        this.coverageGate = coverageGate;
         this.piiRedactor = piiRedactor;
         this.injectionDetector = injectionDetector;
         this.blockInjectionOnIngest = blockInjectionOnIngest;
@@ -84,15 +89,33 @@ public class RagController {
     public RagQueryResponse queryKnowledgeBase(@Valid @RequestBody RagQueryRequest request) {
         long start = System.currentTimeMillis();
 
+        String safeFilename = hasText(request.filename()) ? requireSafeFilename(request.filename()) : null;
+
         // Resolved before the advisor runs, because the advisor reads the user message text and then replaces it.
         RagQueryResolver.Resolution resolution = queryResolver.resolve(request.question(), request.conversationId());
 
+        // Decide whether there is anything to answer from before the model is asked. When the gate says no it
+        // is not called at all, so a question outside the knowledge base gets a refusal instead of an answer
+        // invented from the model's own memory. An answerable question takes the exact path it always did.
+        RagCoverageGate.Decision gate = coverageGate.assess(resolution.retrievalQuery(), request.question(), safeFilename);
+
+        if (!gate.answerable()) {
+            String refusal = piiRedactor.redact(refusalText(gate));
+            List<RetrievedChunk> sources = chunksOfDocuments(gate.candidates());
+            queryResolver.remember(request.conversationId(), request.question(), refusal);
+            log.info("[CRAG] refused question={} searched=\"{}\" closest={}", request.question(), gate.query(),
+                    sources.isEmpty() || sources.get(0).score() == null ? "none" : sources.get(0).score());
+            return new RagQueryResponse(request.question(), resolution.retrievalQuery(), resolution.followUpResolved(),
+                    resolution.outcome().name(), resolution.rewriteTimeMs(), refusal, sources,
+                    gate.outcome().name(), System.currentTimeMillis() - start);
+        }
+
         ChatClientResponse response = chatClient.prompt()
-                .user(resolution.retrievalQuery())
+                .user(gate.query())
                 .advisors(advisors -> {
-                    if (hasText(request.filename())) {
+                    if (safeFilename != null) {
                         advisors.param(QuestionAnswerAdvisor.FILTER_EXPRESSION,
-                                "filename == '" + requireSafeFilename(request.filename()) + "'");
+                                "filename == '" + safeFilename + "'");
                     }
                 })
                 .call()
@@ -111,7 +134,30 @@ public class RagController {
 
         return new RagQueryResponse(request.question(), resolution.retrievalQuery(), resolution.followUpResolved(),
                 resolution.outcome().name(), resolution.rewriteTimeMs(), safeAnswer, sources,
-                System.currentTimeMillis() - start);
+                gate.outcome().name(), System.currentTimeMillis() - start);
+    }
+
+    /**
+     * The refusal a question outside the knowledge base gets. It names what was searched and quotes the
+     * closest passage whether or not it cleared any floor, because SESSION-HANDOFF records that a question
+     * with no answer can score above a real match — so the score is evidence for the reader, not a gate.
+     */
+    private static String refusalText(RagCoverageGate.Decision gate) {
+        StringBuilder refusal = new StringBuilder(
+                "The knowledge base does not appear to cover this question, so I will not answer from memory.");
+        List<Document> candidates = gate.candidates();
+        if (!candidates.isEmpty()) {
+            Document closest = candidates.get(0);
+            Object filename = closest.getMetadata().getOrDefault("filename", "unknown");
+            Double score = closest.getScore();
+            refusal.append(" The closest passage was in ").append(filename);
+            refusal.append(score == null
+                    ? " (no similarity reported)"
+                    : String.format(Locale.ROOT, " (cosine %.3f)", score));
+            refusal.append(", which is not close enough to answer from.");
+        }
+        refusal.append(" Searched: \"").append(gate.query()).append("\".");
+        return refusal.toString();
     }
 
     // An inspection endpoint: an empty list must not look like an empty store, so the reason for zero
@@ -229,9 +275,17 @@ public class RagController {
         if (!(retrieved instanceof List<?> documents)) {
             return List.of();
         }
-        return documents.stream()
+        return chunksOfDocuments(documents.stream()
                 .filter(Document.class::isInstance)
                 .map(Document.class::cast)
+                .toList());
+    }
+
+    private static List<RetrievedChunk> chunksOfDocuments(List<Document> documents) {
+        if (documents == null) {
+            return List.of();
+        }
+        return documents.stream()
                 .map(doc -> new RetrievedChunk(
                         String.valueOf(doc.getMetadata().getOrDefault("filename", "unknown")),
                         doc.getScore(),

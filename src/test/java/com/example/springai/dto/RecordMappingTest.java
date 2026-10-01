@@ -65,6 +65,7 @@ class RecordMappingTest {
                 240L,
                 "Within 30 days of purchase.",
                 List.of(new RetrievedChunk("company-policy.md", 0.61, "within 30 days of purchase")),
+                "GROUNDED",
                 120L
         );
 
@@ -74,6 +75,9 @@ class RecordMappingTest {
         // The searched text is part of the wire contract, not a debug field: a reader needs it to judge the
         // citations.
         assertTrue(json.contains("resolvedQuestion"));
+        // Whether the answer was grounded, re-queried or refused is a contract a caller needs to tell an
+        // honest "I don't know" from an answer.
+        assertTrue(json.contains("groundingOutcome"));
 
         RagQueryResponse deserialized = objectMapper.readValue(json, RagQueryResponse.class);
         assertEquals(ragResponse.question(), deserialized.question());
@@ -81,6 +85,7 @@ class RecordMappingTest {
         assertEquals(ragResponse.followUpResolved(), deserialized.followUpResolved());
         assertEquals(ragResponse.followUpOutcome(), deserialized.followUpOutcome());
         assertEquals(ragResponse.answer(), deserialized.answer());
+        assertEquals(ragResponse.groundingOutcome(), deserialized.groundingOutcome());
         assertEquals(ragResponse.responseTimeMs(), deserialized.responseTimeMs());
     }
 }

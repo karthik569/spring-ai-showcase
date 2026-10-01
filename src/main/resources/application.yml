@@ -68,6 +68,20 @@ app:
   ai:
     # Ceiling on simultaneous model calls; extra requests get an immediate 503 rather than queueing unseen.
     max-concurrent-requests: 4
+  memory:
+    summarization:
+      # A long conversation is summarized rather than truncated: once stored history passes the trigger, the
+      # oldest turns are folded into one summary message and the last few are kept verbatim. Short
+      # conversations are unchanged. Costs one model call only on the turns that cross the trigger.
+      enabled: ${MEMORY_SUMMARIZATION_ENABLED:true}
+      # Summarize once the transcript holds more than this many messages. The default window was 6, so a
+      # user-visible conversation that used to start forgetting keeps its thread here.
+      trigger-messages: 8
+      # Turns kept word-for-word below the summary; the rest is what gets compressed.
+      keep-recent-messages: 4
+      # Upper bound on the raw transcript the delegate retains; the summarizer, not this cap, is the policy.
+      max-window-messages: 30
+      max-summary-chars: 400
   embedding:
     # llama-server serves one model per process, so the vectorizer runs on its own port instead of
     # sharing chat's. Started by start-offline-llm.sh (second llama-server on 8082).
@@ -114,6 +128,23 @@ app:
       # Reciprocal-rank-fusion constant: the rank offset that lets a cosine ranking and a BM25 ranking be
       # merged without calibrating their different score scales.
       rrf-k: 60
+    rerank:
+      # A single listwise model call reorders the fused candidates before topK is taken. Off by default: on
+      # this corpus the fused ranking already puts the gold chunk first (MRR 1.0), so a 0.5B re-ranker mostly
+      # adds latency and noise. Turn on for a larger or noisier corpus.
+      enabled: ${RAG_RERANK_ENABLED:false}
+      # Candidates pulled from the hybrid store before re-ranking; the final result is trimmed back to topK.
+      candidates: 12
+      max-excerpt-chars: 200
+    crag:
+      # Before answering, grade the retrieved chunks; if nothing is relevant, broaden once and then refuse
+      # instead of answering from the model's own memory. The answerable path is unchanged, so this only
+      # spends a grading call on the questions that used to be answered wrongly.
+      enabled: ${RAG_CRAG_ENABLED:true}
+      candidates: 6
+      # Relevant passages required to consider the question answerable.
+      min-relevant: 1
+      max-excerpt-chars: 200
     follow-up:
       # Rewrites "and what about travel?" into a standalone question before the retrieval advisor sees it, and
       # stores RAG turns in the same chat memory so the next follow-up has an antecedent. Costs one extra model

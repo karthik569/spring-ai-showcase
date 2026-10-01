@@ -2,11 +2,12 @@
 
 A Spring AI reference application built with **Java 21**, **Spring Boot 3.5.16** and **Spring AI 1.1.8** (GA).
 
-It demonstrates **ChatClient**, **multi-turn chat memory persisted to a database**, **Retrieval-Augmented
-Generation with document upload, metadata filters and real similarity scores**, **Dynamic Tool / Function
-Calling**, **Structured Record Output Mapping**, **Multimodal Vision**, **reactive token streaming**, and the
-operational layer a model-backed endpoint needs: **timeouts, a live LLM health check, a concurrency ceiling,
-correlated request logging, and OpenAPI docs**.
+It demonstrates **ChatClient**, **multi-turn chat memory persisted to a database and compacted by a rolling
+summary**, **Retrieval-Augmented Generation with document upload, metadata filters, real similarity scores,
+an optional LLM re-rank stage and a coverage gate that refuses an unanswerable question instead of answering
+it from memory**, **Dynamic Tool / Function Calling**, **Structured Record Output Mapping**, **Multimodal
+Vision**, **reactive token streaming**, and the operational layer a model-backed endpoint needs: **timeouts,
+a live LLM health check, a concurrency ceiling, correlated request logging, and OpenAPI docs**.
 
 Any OpenAI-protocol backend works — local Ollama, LM Studio, llama.cpp's server, or a hosted API key. Nothing
 in the code is model-specific. The sample outputs below were produced by `qwen2.5:0.5b-instruct` via Ollama,
@@ -100,8 +101,8 @@ caveat above handled the right way, so RAG scores from this mode are meaningful.
       ├─ ToolCallingController     ├─► ChatClient ─► advisor chain (stable-sorted)
       ├─ StructuredOutputController│        │   SemanticCacheAdvisor     HIGHEST_PRECEDENCE + 10 (chat only, short-circuits)
       ├─ MultimodalController      │        │   TokenUsageAdvisor          LOWEST_PRECEDENCE - 1
-      └─ MetricsController         ┘        │   MessageChatMemoryAdvisor   window 6  ─► H2 ./data/chat-memory
-                                            │   QuestionAnswerAdvisor     topK 4     ─► HybridVectorStore ─► SimpleVectorStore ─► ./data/rag/*.json
+      └─ MetricsController         ┘        │   MessageChatMemoryAdvisor   window 30 + summary  ─► H2 ./data/chat-memory
+                                            │   QuestionAnswerAdvisor     topK 4     ─► RerankingVectorStore ─► HybridVectorStore ─► SimpleVectorStore ─► ./data/rag/*.json
                                             ▼
       OpenAI-protocol backend: Ollama · OpenAI · LM Studio · llama.cpp
                                             │
@@ -121,9 +122,10 @@ runs. `TokenUsageAdvisor` uses `LOWEST_PRECEDENCE - 1` for that reason — see
 | Feature | Component | Implementation notes |
 | :--- | :--- | :--- |
 | **Fluent `ChatClient`** | [`ChatController.java`](src/main/java/com/example/springai/controller/ChatController.java) | System/user roles, `{param}` templating, `Flux<String>` SSE streaming. |
-| **Persisted multi-turn memory** | [`AiConfig.java`](src/main/java/com/example/springai/config/AiConfig.java) | `MessageWindowChatMemory` (6 messages) over the auto-configured JDBC repository and an H2 file database, so transcripts survive a restart. `/chat/memory/history` reads back exactly what the advisor will inject. |
+| **Persisted multi-turn memory** | [`AiConfig.java`](src/main/java/com/example/springai/config/AiConfig.java) | `MessageWindowChatMemory` over the auto-configured JDBC repository and an H2 file database, so transcripts survive a restart. `/chat/memory/history` reads back exactly what the advisor will inject. |
+| **Long-term memory (rolling summary)** | [`SummarizingChatMemory.java`](src/main/java/com/example/springai/memory/SummarizingChatMemory.java) | A `ChatMemory` decorator that folds everything older than the last few turns into one summary message once the stored history passes a trigger, so a long conversation keeps its opening instead of dropping it off a 6-message window. Every failure (a summarizer that throws or returns blank) leaves the transcript intact. Knobs: `app.memory.summarization.*`. |
 | **Token accounting** | [`TokenUsageAdvisor.java`](src/main/java/com/example/springai/advisor/TokenUsageAdvisor.java) | Registered with a `ChatClientCustomizer` so *every* client logs prompt/completion/total to the `TOKEN_USAGE` logger; Spring AI also publishes `gen_ai.client.token.usage` to the metrics endpoint. |
-| **RAG + upload + filters + scores** | [`RagController.java`](src/main/java/com/example/springai/controller/RagController.java) | `QuestionAnswerAdvisor` for grounded answers, `POST /rag/documents` for multipart indexing, a `filename` metadata filter, and `GET /rag/search` that surfaces each chunk's cosine score and explains zero matches. Every response reports `resolvedQuestion`, so the citations can be read against the text that was actually searched. |
+| **RAG + upload + filters + scores** | [`RagController.java`](src/main/java/com/example/springai/controller/RagController.java) | `QuestionAnswerAdvisor` for grounded answers, `POST /rag/documents` for multipart indexing, a `filename` metadata filter, and `GET /rag/search` that surfaces each chunk's cosine score and explains zero matches. Every response reports `resolvedQuestion` (the text that was searched) and `groundingOutcome` (`GROUNDED` / `RE_QUERIED` / `REFUSED` / `DISABLED`). |
 | **Follow-ups resolved before retrieval** | [`RagQueryResolver.java`](src/main/java/com/example/springai/service/RagQueryResolver.java) | A `conversationId` on `/rag/query` buys one cheap model call that rewrites "how long do I have to submit that?" into text an embedder can answer, reading persisted chat memory directly — the retrieval advisor builds its query from the user message and cannot see injected history. Validation decides, not the model's own confidence. |
 | **Knowledge base that survives a restart** | [`RagStorePersistence.java`](src/main/java/com/example/springai/service/RagStorePersistence.java) | `SimpleVectorStore.save`/`load` over two files in `./data/rag`, plus a per-filename SHA-256 manifest so an unchanged shipped document is not re-embedded and a truncated snapshot is discarded loudly instead of silently empty. |
 | **Offline retrieval eval** | [`GoldenQuestionsTest.java`](src/test/java/com/example/springai/rag/GoldenQuestionsTest.java), [`FollowUpRetrievalTest.java`](src/test/java/com/example/springai/rag/FollowUpRetrievalTest.java), [`LiveRetrievalComparisonTest.java`](src/test/java/com/example/springai/rag/LiveRetrievalComparisonTest.java) | 15 golden questions with verbatim answer markers plus 3 follow-up rows, rank-based metrics, and a stub embedder that makes the real cosine/filter/threshold code assertable with Ollama switched off. |
@@ -132,7 +134,9 @@ runs. `TokenUsageAdvisor` uses `LOWEST_PRECEDENCE - 1` for that reason — see
 | **Multimodal vision** | [`MultimodalController.java`](src/main/java/com/example/springai/controller/MultimodalController.java) | Server-side download with a `User-Agent`, address-class screening, `Media` attachment on the prompt. |
 | **Resilience & ops** | [`AiConcurrencyLimitFilter`](src/main/java/com/example/springai/config/AiConcurrencyLimitFilter.java), [`LlmHealthIndicator`](src/main/java/com/example/springai/health/LlmHealthIndicator.java), [`GlobalExceptionHandler`](src/main/java/com/example/springai/error/GlobalExceptionHandler.java) | HTTP timeouts, a cached live probe, a semaphore ceiling with `Retry-After`, and typed error bodies instead of container stack dumps. |
 | **Semantic response cache** | [`SemanticCacheAdvisor.java`](src/main/java/com/example/springai/cache/SemanticCacheAdvisor.java) | The outermost advisor: a paraphrase of a question already answered is replayed from a vector index of prior questions without calling the model, short-circuiting the whole chain (memory, model, token logging). Requests whose answer depends on more than the prompt text — a tool, a conversation, an image, a structured schema — fall straight through. Tunable via `app.cache.*` / `SEMANTIC_CACHE_ENABLED`. |
-| **Hybrid retrieval (BM25 + vector)** | [`HybridVectorStore.java`](src/main/java/com/example/springai/vectorstore/HybridVectorStore.java), [`KeywordIndex.java`](src/main/java/com/example/springai/vectorstore/KeywordIndex.java) | A `@Primary` `VectorStore` decorator that fuses the cosine ranking with a BM25 keyword ranking by reciprocal rank fusion, recovering a chunk that matches on a rare literal term (an acronym) but scores poorly as an embedding. Every caller (`QuestionAnswerAdvisor`, `/rag/search`, the knowledge-base tool) gets it for free; off via `RAG_HYBRID_ENABLED=false`. |
+| **Hybrid retrieval (BM25 + vector)** | [`HybridVectorStore.java`](src/main/java/com/example/springai/vectorstore/HybridVectorStore.java), [`KeywordIndex.java`](src/main/java/com/example/springai/vectorstore/KeywordIndex.java) | A `VectorStore` decorator that fuses the cosine ranking with a BM25 keyword ranking by reciprocal rank fusion, recovering a chunk that matches on a rare literal term (an acronym) but scores poorly as an embedding. Every caller (`QuestionAnswerAdvisor`, `/rag/search`, the knowledge-base tool) gets it for free; off via `RAG_HYBRID_ENABLED=false`. |
+| **Re-rank stage (opt-in)** | [`RerankingVectorStore.java`](src/main/java/com/example/springai/vectorstore/RerankingVectorStore.java), [`LlmReranker.java`](src/main/java/com/example/springai/rag/LlmReranker.java) | A second decorator above the hybrid store that asks the model, in one listwise call, to reorder the fused candidates before trimming to `topK`. Off by default (`app.rag.rerank.enabled=false`) because on this small corpus the fused ranking already hits MRR 1.0, so a 1.5B re-ranker mostly adds latency and noise; it only ever reorders — a candidate is never dropped, and any failure keeps the fused order. |
+| **Self-correcting RAG (coverage gate)** | [`RagCoverageGate.java`](src/main/java/com/example/springai/rag/RagCoverageGate.java), [`LlmContextGrader.java`](src/main/java/com/example/springai/rag/LlmContextGrader.java) | Before the answer model is called, grades the retrieved chunks for coverage. Nothing relevant broadens the search once (using the caller's own words); still nothing → the request is **refused** with the closest passage quoted, instead of answering from the model's own memory. A cosine floor cannot do this — an unanswerable question here scored 0.405, above three genuine matches. Knobs: `app.rag.crag.*`. |
 | **Agentic multi-step loop** | [`AgenticLoopService.java`](src/main/java/com/example/springai/agent/AgenticLoopService.java) | `GET /api/ai/tools/agent` drives the tool-calling loop by hand — model call, `ToolCallingManager.executeToolCalls`, repeat — bounded by `app.agent.max-steps`, and returns the full ordered step trace. Hand-rolled rather than delegated to Spring AI's internal loop so each round is visible. |
 | **Observability & cost** | [`AiMetrics.java`](src/main/java/com/example/springai/observability/AiMetrics.java), [`AiRequestMetricsFilter.java`](src/main/java/com/example/springai/config/AiRequestMetricsFilter.java), [`MetricsController.java`](src/main/java/com/example/springai/controller/MetricsController.java) | A servlet filter folds every `/api/ai` call into requests / tokens / cache hit-rate / latency percentiles, rendered at `GET /api/ai/metrics/summary` and also exported as Micrometer counters (`ai.requests.total`, `ai.tokens.total`, `ai.latency`, `ai.cache.requests.total`). |
 | **Guardrails** | [`PiiRedactor.java`](src/main/java/com/example/springai/guardrail/PiiRedactor.java), [`PromptInjectionDetector.java`](src/main/java/com/example/springai/guardrail/PromptInjectionDetector.java) | `PiiRedactor` masks personal data (email/phone/ssn/ipv4/Luhn-checked card) from every answer before it leaves the API, including streamed chunks. `PromptInjectionDetector` screens uploaded documents for instruction-override patterns at ingest time — a retrieved chunk is injected as *context*, so an "ignore your instructions" document is an indirect injection. Knobs: `app.guardrails.redact-output`, `app.guardrails.block-injection-on-ingest`. |
@@ -244,7 +248,16 @@ curl "http://localhost:8080/api/ai/chat/memory?conversationId=session-42&message
 
 Transcripts live in `./data/chat-memory` (H2), so they survive a restart. `conversationId` is capped at
 **36 characters** because the shipped schema stores it in `VARCHAR(36)` and a longer value fails deep inside
-JDBC. Only the last **6 messages** are injected into a prompt.
+JDBC.
+
+The window is no longer a hard 6-message cut. While the stored history stays at or below the trigger
+(`app.memory.summarization.trigger-messages`, default 8) the transcript is untouched, exactly as before. Past
+it, everything older than the last few turns (`keep-recent-messages`, default 4) is folded into one summary
+message — `"Summary of earlier conversation: …"` — that stays at the head, so a long conversation keeps its
+opening instead of silently dropping it. The summary is redacted by `PiiRedactor` before it is stored, and a
+summarizer call that fails or returns blank leaves the transcript as the window left it rather than replacing
+history with nothing. Set `app.memory.summarization.enabled=false` for the plain window; either way
+`GET /chat/memory/history` shows exactly what the advisor will inject.
 
 - `GET /api/ai/chat/memory/history?conversationId=...` — read the stored window back:
   ```json
@@ -337,6 +350,7 @@ curl -X POST http://localhost:8080/api/ai/rag/query \
     { "filename": "company-policy.md", "score": 0.326529790552246,
       "excerpt": "AWS, GCP, Spring certifications), and taking online training courses. ## 3. Leave Policy & Paid Time Off (PTO) - Standar..." }
   ],
+  "groundingOutcome": "GROUNDED",
   "responseTimeMs": 1579 }
 ```
 
@@ -347,13 +361,57 @@ run the same request answers it correctly.
 `sourceDocuments` comes from the advisor's own retrieval (`QuestionAnswerAdvisor.RETRIEVED_DOCUMENTS`), so the
 citations are literally the chunks that reached the prompt — not a second search that might have matched
 differently. That also means an empty `sourceDocuments` is honest: nothing cleared
-`app.rag.similarity-threshold` (0.2), so the model answered without context. Filtered queries hit this often —
-`{"question": "failover window", "filename": "ops-runbook.md"}` scored the right chunk at 0.08 and correctly
-returned no citations. Run `/rag/search` with the same query and filename to see the score the threshold
-rejected. Scores are not bit-stable with a local embedder: the same query can read 0.1176 on one run and 0.1228
+`app.rag.similarity-threshold` (0.2), so the model answered without context. Filtered queries used to hit this
+often — `{"question": "failover window", "filename": "ops-runbook.md"}` scored the right chunk at 0.08, below
+the floor, and returned no citations. Since hybrid retrieval shipped it no longer does: that chunk matches the
+query's `failover` term on the BM25 leg, and `HybridVectorStore.eligible()` admits a chunk on a keyword hit
+whatever its cosine, so the same request now returns the chunk (measured 0.070, still below the floor) and the
+right answer. Run `/rag/search` with the same query and filename to see the score the floor *would* have
+rejected — that contrast is the reason `/rag/search` exists beside `/rag/query`. With the coverage gate on
+(the default), a request that retrieves nothing is caught before the answer model is asked, and one whose
+candidates do not actually answer it is refused rather than answered from memory — best-effort, see the note
+after the gate's own sample.
+Scores are not bit-stable with a local embedder: the same query can read 0.1176 on one run and 0.1228
 on the next, so treat the third decimal as noise. **`answer` is not reproducible either** — the refusal above is
 one sample of it; the next run of the same request names the $1,500 correctly. Trust `sourceDocuments`, not the
 prose.
+
+#### Refusing instead of answering from memory
+
+The paragraph above describes the failure this gate exists to stop: with an empty (or irrelevant)
+`sourceDocuments`, the model answered anyway, from its own memory. Before the answer model is called,
+`RagCoverageGate` retrieves the top `app.rag.crag.candidates` chunks and asks `LlmContextGrader` which of them
+could answer the question. If none can, the search is broadened **once** — dropping the follow-up rewrite and
+the filename filter, so the caller's own words are tried — and only then is the request refused:
+
+```bash
+curl -X POST http://localhost:8080/api/ai/rag/query -H "Content-Type: application/json" \
+     -d '{"question": "Who won the 2022 World Cup?"}'
+```
+```json
+{ "question": "Who won the 2022 World Cup?",
+  "resolvedQuestion": "Who won the 2022 World Cup?",
+  "followUpResolved": false, "followUpOutcome": "NO_CONVERSATION", "rewriteTimeMs": 0,
+  "answer": "The knowledge base does not appear to cover this question, so I will not answer from memory. The closest passage was in company-policy.md (cosine 0.008), which is not close enough to answer from. Searched: \"Who won the 2022 World Cup?\".",
+  "sourceDocuments": [ { "filename": "company-policy.md", "score": 0.008, "excerpt": "..." } ],
+  "groundingOutcome": "REFUSED" }
+```
+
+`groundingOutcome` makes the decision explicit on every response: `GROUNDED` (the retrieved context covers the
+question — the answer path is otherwise byte-identical to before this gate existed), `RE_QUERIED` (nothing
+covered the original query but the broadened retry did, and `resolvedQuestion` is the broadened text that was
+actually searched), `REFUSED` (answered without the model at all — the refusal quotes the rank-1 candidate's
+cosine **and** filename whether or not it passed anything, and names what was searched), and `DISABLED`
+(`app.rag.crag.enabled=false`). `app.rag.crag.candidates` (6) and `app.rag.crag.min-relevant` (1) tune it.
+
+**The refusal is best-effort, and on this hardware that is a real limit.** The gate is deliberately
+conservative — it fails **open**: a grader reply that names no usable passage is read as "no opinion" and every
+candidate counts as relevant, because a false refusal (dropping a question the model *could* have answered)
+costs more than a mistaken answer. The grader is itself a `qwen2.5-1.5b` that rarely emits the clean `NONE` the
+prompt asks for, so the World Cup request above — `REFUSED` on one run — came back `GROUNDED` on the next two,
+one of which answered *"the 2022 World Cup was won by the France national football team"* from the model's own
+memory. Treat `REFUSED` as "the gate caught it this time", not a guarantee; the honest signal is that
+`sourceDocuments` at 0.008 is not evidence for the answer beside it.
 
 #### Follow-up questions, resolved before retrieval
 Give the same request a `conversationId` and a second question can refer to the first:
@@ -391,9 +449,9 @@ failure, rather than quietly answering the pronoun.
 
 RAG turns are written back into the same chat memory as `POST /api/ai/chat/memory`, so
 `GET /api/ai/chat/memory/history?conversationId=rag-floor-2` shows them — the raw question, not the resolved
-one. Two consequences worth knowing: **the six-message window is shared**, so one RAG exchange displaces two
-chat messages, and the RAG *answer* is stored even when it was ungrounded, because the next "what's the budget
-for that?" refers to the assistant's own prose.
+one. Two consequences worth knowing: **the memory window is shared**, so one RAG exchange spends two of the
+messages the summary compacts, and the RAG *answer* is stored even when the request was refused, because the
+next "what's the budget for that?" refers to the assistant's own prose.
 
 `app.rag.follow-up.enabled` / `.max-history-turns` / `.max-query-chars` / `.require-trigger` (env:
 `RAG_FOLLOW_UP_ENABLED`, `RAG_FOLLOW_UP_REQUIRE_TRIGGER`) configure it; `require-trigger=false` is the default
@@ -541,7 +599,7 @@ exported to `/actuator/metrics` as `ai.requests.total`, `ai.tokens.total`, `ai.l
 ## 🛠 Build, test, package
 
 ```bash
-mvn -B test              # 101 tests — 98 run offline, 3 skipped, no model calls: standalone MockMvc +
+mvn -B test              # 122 tests — 119 run offline, 3 skipped, no model calls: standalone MockMvc +
                          # proxy-faked ChatClient, a stub embedder for the RAG store, @TempDir for the
                          # persistence tests
 mvn -B test -Dapp.rag.eval=true   # runs the skipped ones too: the golden questions and the follow-ups

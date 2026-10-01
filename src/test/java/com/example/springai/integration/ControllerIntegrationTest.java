@@ -8,6 +8,7 @@ import com.example.springai.dto.MovieRecommendation;
 import com.example.springai.error.GlobalExceptionHandler;
 import com.example.springai.guardrail.PiiRedactor;
 import com.example.springai.guardrail.PromptInjectionDetector;
+import com.example.springai.rag.RagCoverageGate;
 import com.example.springai.rag.StubEmbeddingModel;
 import com.example.springai.service.RagDocumentIngestionService;
 import com.example.springai.service.RagQueryResolver;
@@ -130,7 +131,7 @@ class ControllerIntegrationTest {
                 ingestionService(vectorStore),
                 new RagQueryResolver(createFakeChatClient("never searched"), inMemoryChatMemory(),
                         true, 2, 300, false),
-                new PiiRedactor(true), new PromptInjectionDetector(), true, 4, 0.2);
+                disabledGate(), new PiiRedactor(true), new PromptInjectionDetector(), true, 4, 0.2);
         MockMvc mockMvc = MockMvcBuilders.standaloneSetup(controller).build();
 
         // No conversation id: resolution must be invisible, which is what "identical to before the field
@@ -171,7 +172,7 @@ class ControllerIntegrationTest {
         SimpleVectorStore vectorStore = stubbedVectorStore();
         RagController controller = new RagController(createFakeBuilder(answeringClient), vectorStore,
                 ingestionService(vectorStore), new RagQueryResolver(rewriter, memory, true, 2, 300, false),
-                new PiiRedactor(true), new PromptInjectionDetector(), true, 4, 0.2);
+                disabledGate(), new PiiRedactor(true), new PromptInjectionDetector(), true, 4, 0.2);
         MockMvc mockMvc = MockMvcBuilders.standaloneSetup(controller).build();
 
         mockMvc.perform(post("/api/ai/rag/query")
@@ -197,7 +198,7 @@ class ControllerIntegrationTest {
     void testRagQueryRejectsAConversationIdLongerThanTheSchemaColumn() throws Exception {
         SimpleVectorStore vectorStore = stubbedVectorStore();
         RagController controller = new RagController(createFakeBuilder(createFakeChatClient("x", Map.of())),
-                vectorStore, ingestionService(vectorStore), resolverOff(),
+                vectorStore, ingestionService(vectorStore), resolverOff(), disabledGate(),
                 new PiiRedactor(true), new PromptInjectionDetector(), true, 4, 0.2);
         MockMvc mockMvc = MockMvcBuilders.standaloneSetup(controller)
                 .setControllerAdvice(new GlobalExceptionHandler())
@@ -215,7 +216,7 @@ class ControllerIntegrationTest {
     void testRagQueryRejectsABlankQuestion() throws Exception {
         SimpleVectorStore vectorStore = stubbedVectorStore();
         RagController controller = new RagController(createFakeBuilder(createFakeChatClient("x", Map.of())),
-                vectorStore, ingestionService(vectorStore), resolverOff(),
+                vectorStore, ingestionService(vectorStore), resolverOff(), disabledGate(),
                 new PiiRedactor(true), new PromptInjectionDetector(), true, 4, 0.2);
         MockMvc mockMvc = MockMvcBuilders.standaloneSetup(controller)
                 .setControllerAdvice(new GlobalExceptionHandler())
@@ -233,7 +234,7 @@ class ControllerIntegrationTest {
     void testRagUploadRejectsAFileNameThatCouldBreakAFilterExpression() throws Exception {
         SimpleVectorStore vectorStore = stubbedVectorStore();
         RagController controller = new RagController(createFakeBuilder(createFakeChatClient("x", Map.of())),
-                vectorStore, ingestionService(vectorStore), resolverOff(),
+                vectorStore, ingestionService(vectorStore), resolverOff(), disabledGate(),
                 new PiiRedactor(true), new PromptInjectionDetector(), true, 4, 0.2);
         MockMvc mockMvc = MockMvcBuilders.standaloneSetup(controller)
                 .setControllerAdvice(new GlobalExceptionHandler())
@@ -251,7 +252,7 @@ class ControllerIntegrationTest {
     void testRagUploadRejectsAPromptInjectionDocument() throws Exception {
         SimpleVectorStore vectorStore = stubbedVectorStore();
         RagController controller = new RagController(createFakeBuilder(createFakeChatClient("x", Map.of())),
-                vectorStore, ingestionService(vectorStore), resolverOff(),
+                vectorStore, ingestionService(vectorStore), resolverOff(), disabledGate(),
                 new PiiRedactor(true), new PromptInjectionDetector(), true, 4, 0.2);
         MockMvc mockMvc = MockMvcBuilders.standaloneSetup(controller)
                 .setControllerAdvice(new GlobalExceptionHandler())
@@ -268,7 +269,7 @@ class ControllerIntegrationTest {
     void testRagUploadIndexesAPlaintextDocument() throws Exception {
         SimpleVectorStore vectorStore = stubbedVectorStore();
         RagController controller = new RagController(createFakeBuilder(createFakeChatClient("x", Map.of())),
-                vectorStore, ingestionService(vectorStore), resolverOff(),
+                vectorStore, ingestionService(vectorStore), resolverOff(), disabledGate(),
                 new PiiRedactor(true), new PromptInjectionDetector(), true, 4, 0.2);
         MockMvc mockMvc = MockMvcBuilders.standaloneSetup(controller).build();
 
@@ -282,6 +283,61 @@ class ControllerIntegrationTest {
                 .andExpect(jsonPath("$.chunks").value(org.hamcrest.Matchers.greaterThan(0)));
     }
 
+    // The failure SESSION-HANDOFF recorded: a question the knowledge base cannot answer used to be answered
+    // from the model's memory. The gate refuses before the answering model is ever asked, so the client here
+    // throws if it is reached.
+    @Test
+    void testRagQueryRefusesWhenNothingInTheKnowledgeBaseIsRelevant() throws Exception {
+        SimpleVectorStore vectorStore = stubbedVectorStore();
+        vectorStore.add(List.of(Document.builder()
+                .id("facilities-1")
+                .text("The office is closed on public holidays.")
+                .metadata(Map.of("filename", "facilities.md"))
+                .build()));
+        RagCoverageGate gate = new RagCoverageGate(vectorStore, (question, candidates) -> List.of(), true, 6, 1);
+
+        RagController controller = new RagController(createFakeBuilder(forbiddenChatClient()), vectorStore,
+                ingestionService(vectorStore), resolverOff(), gate, new PiiRedactor(true),
+                new PromptInjectionDetector(), true, 4, 0.2);
+        MockMvc mockMvc = MockMvcBuilders.standaloneSetup(controller).build();
+
+        mockMvc.perform(post("/api/ai/rag/query")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"question\":\"What is the parental leave policy?\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.groundingOutcome").value("REFUSED"))
+                .andExpect(jsonPath("$.answer").value(org.hamcrest.Matchers.containsString("does not appear to cover")))
+                .andExpect(jsonPath("$.answer").value(org.hamcrest.Matchers.containsString("facilities.md")))
+                .andExpect(jsonPath("$.sourceDocuments[0].filename").value("facilities.md"));
+    }
+
+    @Test
+    void testRagQueryGroundsWhenTheKnowledgeBaseCoversTheQuestion() throws Exception {
+        SimpleVectorStore vectorStore = stubbedVectorStore();
+        Document chunk = Document.builder()
+                .id("leave-1")
+                .text("Employees receive 25 days of annual leave.")
+                .metadata(Map.of("filename", "policy.md"))
+                .build();
+        vectorStore.add(List.of(chunk));
+        ChatClient answeringClient = createFakeChatClient("You get 25 days.", Map.of(
+                QuestionAnswerAdvisor.RETRIEVED_DOCUMENTS, List.of(chunk)));
+        RagCoverageGate gate = new RagCoverageGate(vectorStore,
+                (question, candidates) -> List.copyOf(candidates), true, 6, 1);
+
+        RagController controller = new RagController(createFakeBuilder(answeringClient), vectorStore,
+                ingestionService(vectorStore), resolverOff(), gate, new PiiRedactor(true),
+                new PromptInjectionDetector(), true, 4, 0.2);
+        MockMvc mockMvc = MockMvcBuilders.standaloneSetup(controller).build();
+
+        mockMvc.perform(post("/api/ai/rag/query")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"question\":\"How many leave days?\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.groundingOutcome").value("GROUNDED"))
+                .andExpect(jsonPath("$.answer").value("You get 25 days."));
+    }
+
     private static ChatMemory inMemoryChatMemory() {
         return MessageWindowChatMemory.builder()
                 .chatMemoryRepository(new InMemoryChatMemoryRepository())
@@ -292,6 +348,24 @@ class ControllerIntegrationTest {
     // Resolution off: a test that is about the endpoint's own contract should not depend on a rewrite client.
     private static RagQueryResolver resolverOff() {
         return new RagQueryResolver(createFakeChatClient("unused"), inMemoryChatMemory(), false, 2, 300, false);
+    }
+
+    // The gate off, exactly as the endpoint behaved before CRAG existed: the answer path runs unchanged.
+    private static RagCoverageGate disabledGate() {
+        return new RagCoverageGate(null, null, false, 6, 1);
+    }
+
+    // Stands in for the answering model, so a refusal that reaches it fails the test instead of answering.
+    private static ChatClient forbiddenChatClient() {
+        return (ChatClient) Proxy.newProxyInstance(
+                ChatClient.class.getClassLoader(),
+                new Class<?>[]{ChatClient.class},
+                (proxy, method, args) -> {
+                    if ("prompt".equals(method.getName())) {
+                        throw new IllegalStateException("the answering client must not be called when refusing");
+                    }
+                    return null;
+                });
     }
 
     private static ChatClient createFakeChatClient(Object responsePayload) {

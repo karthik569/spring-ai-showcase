@@ -146,12 +146,17 @@ curl "http://localhost:8080/api/ai/chat/memory/history?conversationId=guide-1"
 # → messageCount 4, alternating user/assistant — this is literally what gets injected next time
 ```
 
-Two things to notice. Only the last **6** messages are ever injected — a window, not a transcript — so a 200-turn
-conversation does not silently grow your prompt. And the rows are in an H2 file (`./data/chat-memory`), so
-**restart the app and `/history?conversationId=guide-1` still answers**. Kill the JVM, `mvn -B spring-boot:run`
-again, ask for the cat: it still knows. That is the difference between a `Map` in a bean and persistence.
+Two things to notice. Only a bounded window of recent messages is ever injected — not the whole transcript — so
+a 200-turn conversation does not silently grow your prompt. Once the stored history passes a trigger
+(`app.memory.summarization.trigger-messages`, default 8), everything older than the last few turns is folded
+into **one summary message** at the head by `SummarizingChatMemory`, so the model keeps the thread of a long
+conversation instead of forgetting its opening; below the trigger nothing changes. And the rows are in an H2
+file (`./data/chat-memory`), so **restart the app and `/history?conversationId=guide-1` still answers**. Kill
+the JVM, `mvn -B spring-boot:run` again, ask for the cat: it still knows. That is the difference between a `Map`
+in a bean and persistence.
 Code: [`AiConfig`](../src/main/java/com/example/springai/config/AiConfig.java) (`chatMemory`,
-`conversationalChatClient`) and `ChatController`.
+`conversationalChatClient`), [`SummarizingChatMemory`](../src/main/java/com/example/springai/memory/SummarizingChatMemory.java)
+and `ChatController`.
 
 ### Step 3 — RAG: retrieval, and the moment retrieval silently fails
 
@@ -201,32 +206,51 @@ which makes **no** promise about key order — read it by key, never by position
 
 ```bash
 curl "http://localhost:8080/api/ai/rag/search?query=when+is+failover+allowed%3F&topK=3&filename=ops-runbook.md"
-# → one result, score 0.1118, filename ops-runbook.md   ← the chunk IS there
+# → one result, score 0.1082, filename ops-runbook.md   ← the chunk IS there
 
 curl -X POST http://localhost:8080/api/ai/rag/query -H "Content-Type: application/json" \
   -d '{"question":"when is failover allowed?","filename":"ops-runbook.md"}'
-# → answer: "Sorry, but I don't have enough context or history data to determine when failover is allowed…"
-#   sourceDocuments: []
+# → answer: "Failover is allowed only between 02:00-04:00 UTC."
+#   sourceDocuments[0] = ops-runbook.md, score 0.1082   ← cited, and BELOW the 0.2 floor
+#   groundingOutcome: "GROUNDED"
 ```
 
-0.11 is below `app.rag.similarity-threshold`, which is **0.2**, so the advisor retrieved nothing and the model
-answered from memory — fluently, and with no idea what you asked. That is what "RAG is silently not grounded"
-looks like, and it is why `/rag/search` exists separately from `/rag/query`, why `/rag/query` returns the
-chunks it actually used, and why the threshold in this repo is 0.2 rather than the 0.5 you might expect.
+0.108 is below `app.rag.similarity-threshold`, which is **0.2** — and the chunk is cited anyway. That is hybrid
+retrieval: `HybridVectorStore.eligible()` admits a chunk when **either** the vector leg scores it at or above the
+floor **or** the BM25 keyword leg matched a query term, and this chunk literally contains "failover". So the
+floor is a *vector-leg* floor, not a gate on what reaches the prompt — which is why the coverage gate further
+down exists, and why `/rag/search` reports the raw cosine that the floor would have rejected.
 
-Run the experiment, because it is the fastest way to own this intuition. `{"question":"pto"}` at the shipped
-threshold returns exactly one citation at ≈0.33. Restart the app with a higher floor and the same question
-loses its context entirely:
+A warning about "just raise the floor to force discipline" — it does not do what it looks like. `{"question":"pto"}`
+at the shipped threshold returns one citation at ≈0.33, and restarting with a higher floor leaves that citation
+**in place**:
 
 ```bash
 mvn -B spring-boot:run -Dspring-boot.run.arguments=--app.rag.similarity-threshold=0.4
-# then: /rag/query {"question":"pto"} → sourceDocuments: []   (was one chunk at 0.3285)
+# then: /rag/query {"question":"pto"} → sourceDocuments[0] = company-policy.md, score 0.3003   ← still cited
 ```
 
-Same question, same chunks, same model — the only difference is a number in a config file, and the only
-evidence is the citation list.
+Same question, same chunk, still cited: "pto" is a literal token in the document, so the keyword leg recovers it
+whatever the floor says. On this corpus the floor only trims the vector leg; it cannot empty the citation list.
+Neither floor can tell "nothing retrieved" from "retrieved something that does not answer", which is the gap the
+coverage gate fills — when nothing relevant is retrieved it refuses instead of letting the model answer from
+memory, and says so:
 
-There is a second way to land in that same empty-handed state, and it needs no config change at all: ask
+```bash
+curl -X POST http://localhost:8080/api/ai/rag/query -H "Content-Type: application/json" \
+  -d '{"question":"Who won the 2022 World Cup?"}'
+# → answer: "The knowledge base does not appear to cover this question, so I will not answer from memory.
+#            The closest passage was in company-policy.md (cosine 0.008), which is not close enough to answer from.
+#            Searched: \"Who won the 2022 World Cup?\"."
+#   sourceDocuments: [ company-policy.md, score 0.008 ]   groundingOutcome: "REFUSED"   ← no answer-model call
+```
+
+The refusal is best-effort. The gate fails **open** (a grader with no usable opinion counts every candidate as
+relevant) and the local `qwen2.5-1.5b` grader rarely emits the clean `NONE` it is asked for, so the same
+question came back `GROUNDED` on the next two runs — one answering *"the 2022 World Cup was won by the France
+national football team"* from memory. `REFUSED` means the gate caught it this time, not that it always will.
+
+There is a second way to get a citation that cannot answer — this one needs no config change at all: ask
 something on a topic, then ask a follow-up that refers back to it.
 
 ```bash
@@ -246,8 +270,9 @@ curl "http://localhost:8080/api/ai/rag/search?query=how+long+do+I+have+to+submit
 # → one result, score 0.2185, and that chunk does NOT contain the 30-day rule   ← plausible, wrong
 ```
 
-That is the same failure as the runbook above — a chunk that clears the floor and cannot answer — only now the
-reason is an unresolved *that*, and the citation list alone would not tell you: it looks like a real match. So
+That is a chunk that clears the floor and cannot answer — the mirror image of the runbook above, whose chunk
+answered while clearing no floor — and here the reason is an unresolved *that*: the citation list alone would not
+tell you, because it looks like a real match. So
 `/rag/query` reports `resolvedQuestion` on every response, including the ones where nothing was rewritten
 (`followUpOutcome` says why: `NO_CONVERSATION`, `EMPTY_MEMORY`, `PASSTHROUGH`, `DISABLED`, …), and the demo page
 prints it above the answer. Two things this deliberately does **not** do:
@@ -264,8 +289,8 @@ prints it above the answer. Two things this deliberately does **not** do:
 The cost is one extra serial model call — 325–595 ms and ~126–148 tokens here, against a 1.1–2.1 s baseline. Set
 `RAG_FOLLOW_UP_ENABLED=false` and the endpoint is the single-shot one it was before: `followUpOutcome` becomes
 `DISABLED`, `resolvedQuestion` echoes your text, no rewrite call, and no RAG turn written to chat memory. Note
-too that these turns share the six-message window with `/chat/memory`, so a RAG exchange displaces two chat
-messages there.
+too that these turns share the same chat memory as `/chat/memory`: the rolling summary (see step 2) keeps the
+thread, but a RAG exchange still costs two messages in that window, which is what the summary eventually folds.
 
 There is a version of that experiment you can run with the model switched off. `mvn -B test` indexes the same
 policy document into the same store, embeds it with a deterministic term-hash stub, and checks 15 golden
@@ -380,8 +405,8 @@ Code: [`StructuredOutputController`](../src/main/java/com/example/springai/contr
 ## 4. Read the source in this order
 
 1. [`SpringAiApplication.java`](../src/main/java/com/example/springai/SpringAiApplication.java) — a normal Boot main class; Spring AI is just a starter on the classpath.
-2. [`application.yml`](../src/main/resources/application.yml) — the four `OPENAI_*` variables, the memory window, the RAG threshold, the concurrency ceiling. Most "what if I change this" questions are answered here first.
-3. [`AiConfig.java`](../src/main/java/com/example/springai/config/AiConfig.java) — the two `ChatClient` beans and *why there are two*. Read the comments; they encode a 1.1.6 behaviour change.
+2. [`application.yml`](../src/main/resources/application.yml) — the four `OPENAI_*` variables, the memory window and its summary trigger, the RAG threshold, the coverage-gate and re-rank switches, the concurrency ceiling. Most "what if I change this" questions are answered here first.
+3. [`AiConfig.java`](../src/main/java/com/example/springai/config/AiConfig.java) — the `ChatClient` beans and *why there is more than one*. Read the comments; they encode a 1.1.6 behaviour change and a recursion trap.
 4. [`ChatController.java`](../src/main/java/com/example/springai/controller/ChatController.java) — the fluent API: `.prompt().system(...).user(...).call().content()`, plus `.stream()`.
 5. [`TokenUsageAdvisor.java`](../src/main/java/com/example/springai/advisor/TokenUsageAdvisor.java) — the smallest complete advisor, and its one-line ordering trap.
 6. [`RagController.java`](../src/main/java/com/example/springai/controller/RagController.java) — the advisor that does retrieval, and how citations are read back from the call's own context.

@@ -96,7 +96,7 @@ Four showcase extensions, chosen from a menu and all verified live against the l
    answered question is replayed from a vector index of prior questions without a model call. Skips requests
    whose answer depends on more than the prompt (tools / conversation / media / output schema). `app.cache.*`,
    default threshold 0.95.
-2. **Hybrid retrieval** — `HybridVectorStore` (`@Primary` `VectorStore` decorator) fusing the cosine ranking
+2. **Hybrid retrieval** — `HybridVectorStore` (`VectorStore` decorator, since widened below) fusing the cosine ranking
    with `KeywordIndex` (BM25) via reciprocal rank fusion. `RAG_HYBRID_ENABLED`, `candidate-pool`, `rrf-k`.
 3. **Agentic multi-step loop** — `AgenticLoopService` + `GET /api/ai/tools/agent`; the loop is driven by hand
    (model call → `ToolCallingManager.executeToolCalls` → repeat) so each round is a returned `Step`, bounded by
@@ -126,6 +126,49 @@ formatter turns two of its tests red. Live re-check: cold 11.12 s → cached 0.1
   runs). A smoke instance must override `--spring.datasource.url=jdbc:h2:mem:...`.
 - **The agent's ambient env leaks into a spawned app**: `OPENAI_BASE_URL=https://tokenharbor.ai/v1` and friends
   must be scrubbed with `env -u` and the local `base-url`/dummy key set explicitly, or requests 404 upstream.
+
+## What changed later on 2026-10-01 (the memory, re-rank and coverage round)
+
+Three more showcase extensions, defaults chosen with the user: **memory summarization ON, coverage gate ON,
+re-rank OFF**. Verified live against the local llama.cpp servers (chat `qwen2.5-1.5b` on 8081, `all-minilm` on
+8082) through a scratch instance on 8083 (`--spring.datasource.url=jdbc:h2:mem:verify`,
+`--app.rag.store.directory=./target/rag-verify`), leaving the user's app and the two llama-servers untouched.
+
+1. **Long-term memory** — `SummarizingChatMemory` decorates the repository-backed `MessageWindowChatMemory`:
+   once stored history passes `app.memory.summarization.trigger-messages` (8), everything but the last
+   `keep-recent-messages` (4) is folded into one `SystemMessage` ("Summary of earlier conversation: …"), and the
+   window widens to `max-window-messages` (30) so the summarizer, not the trim, is the policy. The
+   `MessageChatMemoryAdvisor` and the plain window are untouched — below the trigger it is byte-identical. Live:
+   five `/chat/memory` turns on `conversationId=verify-summary` logged `folded 5 message(s) into a summary`, and
+   `/chat/memory/history` then showed the summary at the head plus the recent turns verbatim.
+2. **Re-rank stage (opt-in)** — `RerankingVectorStore` is the new `@Primary VectorStore`, a second decorator over
+   the concrete `HybridVectorStore`; `LlmReranker` makes one listwise call over the fused candidates and appends
+   anything it did not name. Off by default (`app.rag.rerank.enabled=false`) because the fused ranking already
+   hits MRR 1.0 here. The change also added `KeywordLegRebuildable` so the boot keyword-index rebuild
+   (`RagDocumentIngestionService`) survives it — the old `instanceof HybridVectorStore` test would have silently
+   stopped rebuilding once the `@Primary` store moved.
+3. **Self-correcting RAG (CRAG)** — `RagCoverageGate` + `LlmContextGrader` decide, before the answer model is
+   called, whether any retrieved chunk can answer the question; if not, the search is broadened once (raw
+   question, no filename filter) and then the request is **refused** instead of answered from memory. Every
+   response carries `groundingOutcome` (`GROUNDED` / `RE_QUERIED` / `REFUSED` / `DISABLED`); new config
+   `app.rag.crag.*`.
+
+**Two measurements this round, both worth keeping:**
+
+- **The cosine floor is a vector-leg floor, not a gate.** `HybridVectorStore.eligible()` admits a chunk on a
+  BM25 keyword hit whatever its cosine, so `{"question":"failover window","filename":"ops-runbook.md"}` (right
+  chunk measured 0.07) and `{"question":"pto"}` at a raised `--app.rag.similarity-threshold=0.4` (chunk measured
+  0.30) are both still cited. The `docs/GETTING_STARTED.md` step-3 samples that showed `sourceDocuments: []` for
+  exactly these were measured before hybrid shipped and no longer reproduce; they were rewritten this round.
+- **The coverage gate's refusal is best-effort on a weak grader.** `LlmContextGrader` fails **open** (a blank or
+  unparseable reply means every candidate is relevant), and `qwen2.5-1.5b` rarely emits the clean `NONE` the
+  prompt asks for, so the same "Who won the 2022 World Cup?" request was `REFUSED` on one run (cosine 0.008) and
+  `GROUNDED` on the next two — one of which answered *"the 2022 World Cup was won by the France national football
+  team"* from the model's own memory. The gate catches the clear cases; on this backend it is not a guarantee.
+
+**Tests**: 101 → 122 (offline tiers unchanged; the two `@SpringBootTest` live tiers still skipped). New unit
+classes `SummarizingChatMemoryTest`, `RerankingVectorStoreTest`, `LlmRerankerTest`, `RagCoverageGateTest`, plus
+`REFUSED`/`GROUNDED` integration tests whose answering client is a proxy that throws if a refusal ever calls it.
 
 ## Phase 0, measured before the conversation-aware RAG code existed (2026-09-30)
 
@@ -353,10 +396,11 @@ you document any sample output:
   (`The Matrix`, 2016); 422 appears when the model leaves `director` empty, and its `rawModelOutput` then shows
   `"title": "Inception", "releaseYear": 2017`. Both are correct behaviour of `validated(...)` — quote them as a
   pair, not as one canonical response.
-- Live numbers from that pass: `pto` search top 0.3285 / second 0.1992, sentence query 0.5629, uploaded runbook
-  chunk 0.1118 (below the 0.2 threshold → `sourceDocuments: []`), `/chat/memory` recall answered `Miso.` and on
-  a second conversation `Misto.`, health details `{model, reply, latencyMs, probedAt}`, 8-request burst →
-  `503 503 503 503 200 200 200 200`.
+- Live numbers from that pass (measured *before* hybrid retrieval shipped; with hybrid on the runbook chunk is
+  cited at ~0.07 rather than dropped — see the memory/re-rank/coverage round above): `pto` search top 0.3285 /
+  second 0.1992, sentence query 0.5629, uploaded runbook chunk 0.1118 (below the 0.2 threshold →
+  `sourceDocuments: []` then), `/chat/memory` recall answered `Miso.` and on a second conversation `Misto.`,
+  health details `{model, reply, latencyMs, probedAt}`, 8-request burst → `503 503 503 503 200 200 200 200`.
 - `/v3/api-docs` reports **15** operations — don't quote a count in the docs; it changes with every endpoint.
 
 ## Deliberate non-decisions
@@ -425,10 +469,13 @@ moves them.
    invalidate every quoted `Indexed 3 chunks` line and every score sample in `README.md` §6 and
    `docs/GETTING_STARTED.md` — those numbers were measured, not invented, and re-measuring them is a separate
    pass.
-6. **Superseded in part on 2026-10-01: hybrid retrieval (a) shipped as `HybridVectorStore` / `KeywordIndex`,
-   and groundedness became the tier-3 `GroundednessJudgeTest`.** The measurements below are kept because they
-   are *why* hybrid is framed as recall insurance (a second way to be right) rather than a rank fix — read them
-   before changing the fusion. (a) *Hybrid retrieval is justified by acronym recall on the vector leg*: with live `all-minilm`, all
+6. **Closed on 2026-10-01: hybrid retrieval (a) shipped as `HybridVectorStore` / `KeywordIndex`; the coverage
+   gate (b/c) shipped as `RagCoverageGate` / `LlmContextGrader` (`app.rag.crag.enabled`, on by default); and the
+   re-rank stage shipped as `RerankingVectorStore` / `LlmReranker` (`app.rag.rerank.enabled`, **off** by
+   default). Groundedness also became the tier-3 `GroundednessJudgeTest`.** The measurements below are kept
+   because they are *why* hybrid is framed as recall insurance (a second way to be right) rather than a rank fix,
+   and why the gate is a coverage test and not a threshold — read them before changing either. Note the gate's
+   caveat from the round above: it is only as reliable as the grader, which on this backend fails open. (a) *Hybrid retrieval is justified by acronym recall on the vector leg*: with live `all-minilm`, all
    13 `match` rows — `pto` and `PII` included — came back at **rank 1** (MRR 1.000, same as the stub tier). The
    rank evidence on this corpus says BM25 would be a second way to be right, not a fix. Re-measure unfiltered, on
    a bigger corpus, before writing `Bm25Scorer`. (b) *A grounding gate can be a score comparison*: the `nomatch`
@@ -439,6 +486,13 @@ moves them.
    **rank 1 with cosine 0.158**, i.e. under `app.rag.similarity-threshold: 0.2`. Correct retrieval plus a correct
    drop. A gate that only looks at "did something clear the floor" cannot distinguish that from a genuine miss,
    so the refusal has to quote the rank-1 candidate's score whether or not it passed.
+7. **The coverage gate is only as good as its grader.** Measured live on 2026-10-01, `RagCoverageGate` refused a
+   clearly off-corpus question ("Who won the 2022 World Cup?") on one run and grounded it on the next two — the
+   `qwen2.5-1.5b` grader rarely returns the clean `NONE` the prompt asks for, and `LlmContextGrader` fails
+   **open** by design, so a non-`NONE`, non-numeric reply widens back to "all candidates relevant". A stronger
+   grader (a larger local model, or a stricter reply format with a bounded retry) would make `REFUSED` reliable;
+   until then it is best-effort. Do not tune `app.rag.crag.min-relevant` upward to compensate — that trades a
+   missed refusal for false refusals, which the fail-open design exists to avoid.
 8. Consider a local model upgrade if factual answers matter more than staying offline.
 9. `ARCHITECTURE_AND_METHODS.md`, `README.md` and `docs/GETTING_STARTED.md` were rewritten against 1.1.8 on
    2026-09-30 — every quoted sample in them was produced by running the command in this repo's shell that day,
@@ -452,5 +506,5 @@ moves them.
     discarded a correct rewrite. If the backend changes (`qwen2.5:0.5b-instruct` → anything else), re-run the
     two-turn check in §Conversation-aware RAG before trusting the numbers: a different model fails this validation
     in ways `RagQueryResolverTest` cannot predict. Also still open by choice: resolution is *not* applied to
-    `GET /rag/search` (it is the debug endpoint) and RAG turns share the six-message window with `/chat/memory`
-    rather than living in a separate namespace.
+    `GET /rag/search` (it is the debug endpoint) and RAG turns share one chat memory with `/chat/memory` (now
+    summarized rather than hard-truncated) rather than living in a separate namespace.

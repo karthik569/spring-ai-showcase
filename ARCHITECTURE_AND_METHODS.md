@@ -29,7 +29,7 @@ stronger than the 0.5B figures here.
   │   SemanticCacheAdvisor          order = HIGHEST_PRECEDENCE + 10   (chat client only; a hit short-circuits)
   │   TokenUsageAdvisor             order = LOWEST_PRECEDENCE - 1
   │   MessageChatMemoryAdvisor      (conversational client only)
-  │   QuestionAnswerAdvisor         (RAG client only) ─► HybridVectorStore ─► SimpleVectorStore
+  │   QuestionAnswerAdvisor         (RAG client only) ─► RerankingVectorStore ─► HybridVectorStore ─► SimpleVectorStore
   │   ChatModelCallAdvisor / ChatModelStreamAdvisor   ← appended by Spring AI, order = MAX_VALUE
   ▼
  ChatModel (OpenAI starter) ──► RestClient / WebClient ──► model backend
@@ -96,7 +96,8 @@ Also read from bytecode, and the reason `RagQueryResolver` exists as a service r
 
 | Method | Behaviour | Why |
 | :--- | :--- | :--- |
-| `chatMemory(ChatMemoryRepository)` | `MessageWindowChatMemory` bounded to **6** messages over the auto-configured JDBC repository. | A window, not the whole transcript: the local model's context is small enough that unbounded history pushes the actual question out of the prompt. The repository owns its schema; this bean only bounds the window. |
+| `chatMemory(ChatMemoryRepository, conversationSummarizer, PiiRedactor, app.memory.summarization.*)` | When summarization is on (default) a `SummarizingChatMemory` over a `MessageWindowChatMemory` bounded to `max-window-messages` (30); when off, the plain window bounded to **6**. | A window alone drops the opening of a long conversation, and the local model's context is too small for unbounded history, so the fix is a compressed window, not a bigger one. The delegate window is an upper bound; the summarizer, not the trim, is the policy. See §10. |
+| `conversationSummarizer(ChatClient.Builder)` | `@Qualifier("conversationSummarizer")`; system prompt + `temperature 0.0`, `maxTokens 256`, and **no** default advisors. | The rolling summary's client. Separate for the same reason as `ragQueryRewriter`: a client built from a builder that already carries `MessageChatMemoryAdvisor` would recurse through the memory it is compacting. The `tokenUsageAdvisorCustomizer` still counts its tokens. |
 | `tokenUsageAdvisorCustomizer(AiMetrics)` | `ChatClientCustomizer` adding `TokenUsageAdvisor` to every builder. | Controllers build clients in their constructors (RAG needs a store-specific advisor); a customizer means each one does not re-declare token accounting. It takes `AiMetrics` so the token counters and the `/metrics/summary` roll-up are the same numbers. |
 | `semanticCacheAdvisor(EmbeddingModel, AiMetrics, app.cache.*)` | `SemanticCacheAdvisor` over its own `SimpleVectorStore`. `@Value`-bound `enabled` (true), `similarity-threshold` (0.95), `max-entries` (200), `ttl` (PT30M). | Attached to `chatClient` **alone** — see §10. Its own store, not the knowledge base, so a cached answer can never surface as a RAG citation. |
 | `chatClient(ChatClient.Builder, SemanticCacheAdvisor)` | Stateless client with the shared system prompt; `.defaultAdvisors(semanticCacheAdvisor)`. | Tools, structured output and vision have no conversation. Since Spring AI **1.1.6** `MessageChatMemoryAdvisor` *rejects* a call with no conversation id, so a memory-carrying client could not serve them even if it were desirable. The cache advisor is here and nowhere else, because a request through this client is the only one whose answer is a pure function of the prompt. |
@@ -104,7 +105,13 @@ Also read from bytecode, and the reason `RagQueryResolver` exists as a service r
 | `ragQueryRewriter(ChatClient.Builder)` | `@Qualifier("ragQueryRewriter")`; system prompt + `temperature 0.0`, `maxTokens 64`, and **no** default advisors. | The follow-up resolver's client. Separate because `defaultAdvisors` accumulates: built from the RAG builder it would inherit `QuestionAnswerAdvisor` and retrieve policy text in answer to its own rewriting instruction. Deterministic options because a rewriter that improvises has to be validated, not trusted. |
 | `embeddingModel(app.embedding.*)` | `@Primary` `OpenAiEmbeddingModel` built against **its own** `base-url` (default `http://localhost:8082`) and model (`all-minilm`), `MetadataMode.EMBED`. | A chat model used as the vectorizer returns vectors that rank near-randomly, and the single `spring.ai.openai.base-url` cannot point chat and embeddings at different servers. `@Primary` because the auto-configured `OpenAiEmbeddingModel` also implements `EmbeddingModel` and would otherwise make the store injection ambiguous. |
 | `vectorStore(EmbeddingModel)` | `SimpleVectorStore` — in-memory, cosine, `all-minilm` vectors. | Zero-infrastructure RAG. Returns the **subtype**, not `VectorStore`, because persistence lives on it (`save`/`load`); every injection point still asks for the interface. Snapshotted to `./data/rag` by `RagStorePersistence`, so uploads survive a restart. The alternative is still a real vector database, which this showcase deliberately does not pull in. |
-| `hybridVectorStore(SimpleVectorStore, KeywordIndex, app.rag.hybrid.*)` | `@Primary` `VectorStore` = `HybridVectorStore`. `enabled` (true), `candidate-pool` (50), `rrf-k` (60). | What every `VectorStore` injection point actually receives, so the `QuestionAnswerAdvisor`, `/rag/search` and the knowledge-base tool get BM25-fused ranking without knowing it. Callers that need the raw store (`save`/`load`, the boot enumeration) still ask for the concrete `SimpleVectorStore`. See §10. |
+| `hybridVectorStore(SimpleVectorStore, KeywordIndex, app.rag.hybrid.*)` | `HybridVectorStore` (the concrete type, no longer `@Primary`). `enabled` (true), `candidate-pool` (50), `rrf-k` (60). | The fusion layer. Exposed concretely so callers that need `rebuildKeywordIndex` (the boot ingestion runner, via `KeywordLegRebuildable`) and the CRAG coverage gate — which wants the fused ranking without the re-ranker's model call — can ask for it directly. Callers that need the raw store (`save`/`load`, the boot enumeration) ask for `SimpleVectorStore`. See §10. |
+| `rerankingVectorStore(HybridVectorStore, Reranker, app.rag.rerank.*)` | `@Primary` `VectorStore` = `RerankingVectorStore`. `enabled` (false), `candidates` (12). | What every `VectorStore` injection point receives, so the `QuestionAnswerAdvisor`, `/rag/search` and the knowledge-base tool see the re-ranked order without knowing it. Off by default; when on, it reorders the fused pool but never drops a candidate. See §10. |
+| `reranker(ragReranker, app.rag.rerank.max-excerpt-chars)` | `LlmReranker` behind the `Reranker` interface. | A bean, not a `new`, so the retrieval tests can substitute a deterministic re-ranker. |
+| `ragReranker(ChatClient.Builder)` | `@Qualifier("ragReranker")`; system prompt + `temperature 0.0`, `maxTokens 32`. | The re-ranker's client (`ChatController`'s builder already carries the RAG advisor, so the ranking must not). Single-digit output because the reply is an index list. |
+| `contextGrader(ragGrader, app.rag.crag.max-excerpt-chars)` | `LlmContextGrader` behind the `ContextGrader` interface. | Separate from `reranker` because the grader may answer "NONE" — nothing here answers the question — which the re-ranker may not. |
+| `ragGrader(ChatClient.Builder)` | `@Qualifier("ragGrader")`; system prompt + `temperature 0.0`, `maxTokens 32`. | The coverage gate's client. |
+| `ragCoverageGate(HybridVectorStore, ContextGrader, app.rag.crag.*)` | `RagCoverageGate`. `enabled` (true), `candidates` (6), `min-relevant` (1). | The pre-answer gate. Built over the concrete `HybridVectorStore`, not the `@Primary` store, so coverage reflects fusion and skips the re-rank call. See §10. |
 
 ### [`EndpointLoggingFilter.java`](src/main/java/com/example/springai/config/EndpointLoggingFilter.java)
 
@@ -178,12 +185,12 @@ as "no conversation" and stays the single-shot endpoint it was. Same 36-characte
 
 | Method | Route | Notes |
 | :--- | :--- | :--- |
-| `queryKnowledgeBase` | `POST /api/ai/rag/query` | `QuestionAnswerAdvisor` retrieves, the model answers, and citations come from `response.context().get(RETRIEVED_DOCUMENTS)` — literally the chunks that reached the prompt. `filename` maps to the advisor's `FILTER_EXPRESSION` parameter. `RagQueryRequest` is `{question, filename, conversationId}`: how many chunks get injected is `app.rag.top-k`, a deployment setting, and the per-request `topK` field that used to sit here was validated, documented and never read. The retrieval text is `queryResolver.resolve(...)` first and `.user(...)` second — see §2 for why an advisor cannot do this — and the turn is written back with `queryResolver.remember(...)` only after a non-blank answer, never from a failure path. |
+| `queryKnowledgeBase` | `POST /api/ai/rag/query` | `queryResolver.resolve(...)` produces the retrieval text, `RagCoverageGate.assess(...)` decides whether anything in the knowledge base covers it, and only then is the answer model asked. When it does, `QuestionAnswerAdvisor` retrieves, the model answers, and citations come from `response.context().get(RETRIEVED_DOCUMENTS)` — literally the chunks that reached the prompt; the advisor's user text is `decision.query()` so a broadened retry is really searched. When it does not, the model is **not** called: a refusal names what was searched and quotes the rank-1 candidate, and `groundingOutcome` (in `RagQueryResponse`) reports `GROUNDED` / `RE_QUERIED` / `REFUSED` / `DISABLED`. `filename` maps to the advisor's `FILTER_EXPRESSION` parameter. `RagQueryRequest` is `{question, filename, conversationId}`: how many chunks get injected is `app.rag.top-k`, a deployment setting, and the per-request `topK` field that used to sit here was validated, documented and never read. The turn is written back with `queryResolver.remember(...)` on both paths — the refusal is stored as the answer — never from a failure path. See §10. |
 | `rawVectorSearch` | `GET /api/ai/rag/search` | `similarityThresholdAll()` plus an optional `FilterExpressionBuilder().eq("filename", …)`. Surfaces `Document.getScore()`. When nothing matches it returns `totalResults: 0` **and** a `note`, because an inspection endpoint that returns a bare empty list cannot be told apart from an empty store. |
 | `addDocument` | `POST /api/ai/rag/documents` | `multipart/form-data`, ≤512 KB per file, text-like content types only (else `415`), screened for prompt-injection patterns (else `422` — see below), then `evict(filename)` before `ingest(...)` so re-uploading replaces instead of duplicating. |
 
-The constructor injects `VectorStore` (which is the `@Primary` `HybridVectorStore`, §10) and both guardrails,
-so `/query` retrieves through hybrid search and both `/query` and `/documents` are screened.
+The constructor injects `VectorStore` (which is the `@Primary` `RerankingVectorStore`, whose delegate is `HybridVectorStore`, §10), the `RagCoverageGate` and both guardrails, so `/query` retrieves through hybrid (and optionally re-ranked)
+search, is coverage-gated before the model is asked, and both `/query` and `/documents` are screened.
 
 Three guards are load-bearing:
 
@@ -387,9 +394,9 @@ it.
   time is it" from training data. An unknown zone is returned as an `error` string rather than thrown, so the
   model can retry with an IANA name.
 - **`searchKnowledgeBase`** — RAG exposed as a *tool*: the model decides a question needs the knowledge base,
-  and the tool searches the (hybrid, `@Primary`) store with a **zero** floor, the same as `/rag/search`, because
-  a threshold tuned for the grounded endpoint would silently empty the tool's answer. Used by the agentic and
-  assistant routes; `/rag/query` keeps its advisor.
+  and the tool searches the injected (`@Primary`, hybrid-backed) store with a **zero** floor, the same as
+  `/rag/search`, because a threshold tuned for the grounded endpoint would silently empty the tool's answer.
+  Used by the agentic and assistant routes; `/rag/query` keeps its advisor (plus the coverage gate).
 
 [`AgenticLoopService`](src/main/java/com/example/springai/agent/AgenticLoopService.java) drives the same
 toolbox by hand for `GET /tools/agent` — see §10.
@@ -509,7 +516,7 @@ upload → 1 chunk → restart → 3 chunks.
 ## 9. How to test
 
 ```bash
-mvn -B test                              # 101 tests: 98 run offline, 3 skipped
+mvn -B test                              # 122 tests: 119 run offline, 3 skipped
 mvn -B test -Dapp.rag.eval=true          # + the two live tier-2 tables (golden questions, follow-ups)
 mvn -B test -Dapp.rag.judge=true         # + tier 3: an LLM-as-judge groundedness table (two prompts/row)
 ```
@@ -586,18 +593,21 @@ context. Scores are **printed, never gated** (a 1.5B judge is itself noisy); the
 row produced a parseable digit, which is the infrastructure claim. It overrides `spring.datasource.url` to an
 in-memory H2 for the same file-lock reason tier 2 does.
 
-The rest of the 98 is offline unit tests, among them `HybridRetrievalTest` (the BM25 fusion),
+The rest of the 119 is offline unit tests, among them `HybridRetrievalTest` (the BM25 fusion),
 `SemanticCacheAdvisorTest` (including the `MetadataInclusiveEmbeddingModel` that pins the cache-key asymmetry,
 §10), `AgenticLoopServiceTest` and `AiMetricsTest` (the enhancement round), `CalculatorToolServiceTest`,
 `DateTimeToolServiceTest`, `KnowledgeBaseToolServiceTest`, `PiiRedactorTest`, `PromptInjectionDetectorTest`
-(tools + guardrails), `StructuredOutputConverterTest`, and the existing tool/record mapping tests.
+(tools + guardrails), `StructuredOutputConverterTest`, and the existing tool/record mapping tests. The
+memory/re-rank/CRAG round added `SummarizingChatMemoryTest`, `RerankingVectorStoreTest`, `LlmRerankerTest` and
+`RagCoverageGateTest` (§10), plus a `REFUSED` and a `GROUNDED` case in `ControllerIntegrationTest` — all tier 0,
+no model calls, a scripted fake `ChatClient` and a real store over `StubEmbeddingModel`.
 
 **What still needs a real model:** grounded RAG *answers*, token log lines, tool execution, SSE incremental
 delivery, health DOWN with no backend. See `README.md`.
 
 ---
 
-## 10. Cache, hybrid retrieval, the agent loop and metrics
+## 10. Cache, retrieval, memory, the agent loop and metrics
 
 ### [`SemanticCacheAdvisor.java`](src/main/java/com/example/springai/cache/SemanticCacheAdvisor.java)
 
@@ -624,23 +634,79 @@ Config: `app.cache.enabled`, `similarity-threshold` (0.95), `max-entries` (200, 
 
 ### [`HybridVectorStore.java`](src/main/java/com/example/springai/vectorstore/HybridVectorStore.java) / [`KeywordIndex.java`](src/main/java/com/example/springai/vectorstore/KeywordIndex.java)
 
-A `@Primary` decorator, not a replacement: it implements `VectorStore`, so every caller — the
+A `VectorStore` decorator, not a replacement: it implements `VectorStore`, so every caller — the
 `QuestionAnswerAdvisor`, `/rag/search`, `KnowledgeBaseToolService` — gets hybrid retrieval without knowing it
 is talking to a decorator. The vector leg remains the source of truth for a chunk's reported `score` (its
-cosine); the decorator only changes *order* and *membership*.
+cosine); the decorator only changes *order* and *membership*. (It is no longer `@Primary`: the optional
+`RerankingVectorStore` sits above it and takes that role.)
 
 The two ranked lists are merged by reciprocal rank fusion (`rrf-k`), which needs no calibration between a
 cosine and a BM25 number. A document is eligible if the vector leg ranked it at or above the threshold **or**
 the keyword leg matched a query term — the union is what recovers the acronym chunk the cosine floor drops. The
 corpus is small, so the vector leg runs over a pool at least as wide as the index, meaning a keyword-only
 document still usually carries a real cosine to report. `rebuildKeywordIndex()` repopulates the BM25 leg after
-`RagStorePersistence` restores chunks straight into the inner store, bypassing this decorator's `add`.
+`RagStorePersistence` restores chunks straight into the inner store, bypassing this decorator's `add`. It is
+reached through the [`KeywordLegRebuildable`](src/main/java/com/example/springai/vectorstore/KeywordLegRebuildable.java)
+interface, not an `instanceof HybridVectorStore` check, because once `RerankingVectorStore` is `@Primary` the
+injected `VectorStore` is a different type and the check would silently stop rebuilding the index.
 
 The keyword leg runs in this process, so it cannot hand a filter expression to the store the way the vector leg
 does; [`MetadataFilters`](src/main/java/com/example/springai/vectorstore/MetadataFilters.java) evaluates the
 `Filter.Expression` against each document's metadata itself, supporting the `EQ` / `AND` / `OR` / `NOT`
 operators the app builds and matching everything on anything exotic, so a filter it cannot read weakens the
 keyword leg rather than failing the request.
+
+### [`RerankingVectorStore.java`](src/main/java/com/example/springai/vectorstore/RerankingVectorStore.java) / [`LlmReranker.java`](src/main/java/com/example/springai/rag/LlmReranker.java)
+
+The optional second decorator, and now the `@Primary` `VectorStore`. It wraps the concrete `HybridVectorStore`,
+so the re-rank applies to every `VectorStore` injection point without the fusion class learning about the model
+— and, more importantly, so the CRAG coverage gate can retrieve from the fusion layer directly and skip the
+re-rank call. On a search it asks the delegate for `max(topK, candidates)` documents, re-ranks that pool, then
+trims to `topK`; when the pool is no larger than `topK` there is nothing to reorder and the delegate is returned
+untouched, which is also the whole behaviour when `app.rag.rerank.enabled=false` (the default).
+
+`LlmReranker` is listwise: N passages scored with N calls would cost N generations where one generation is the
+whole request, so the passages are numbered and the model returns the order in a single short reply. It changes
+**only order** — every returned document is one it was handed — because a re-ranker that could drop a passage
+would be a filter wearing a ranking's name, and a noisy 1.5B model is not trusted with that. A reply that names
+some indices puts those first and appends the rest in fused order; a blank, unparseable or exception-producing
+reply leaves the fused order in place. It is off by default because on this corpus the fused ranking already
+hits MRR 1.0, so the re-ranker mostly adds latency — it ships as a config-gated stage rather than as dead code.
+
+### [`RagCoverageGate.java`](src/main/java/com/example/springai/rag/RagCoverageGate.java) / [`LlmContextGrader.java`](src/main/java/com/example/springai/rag/LlmContextGrader.java)
+
+The "correct" step of a self-correcting RAG, made as narrow as possible. `SESSION-HANDOFF` records that a
+cosine floor cannot separate answerable from unanswerable here — an unanswerable question scored 0.405, above
+three genuine matches — so the gate is a relevance judgement, not a threshold: it retrieves the top
+`app.rag.crag.candidates` chunks (with `similarityThresholdAll()`, so no floor hides a real match) and asks the
+grader which could answer. If at least `min-relevant` can, the request proceeds down the **exact** path it took
+before the gate existed, so every quoted sample stays valid. If none can, the search is broadened **once** —
+dropping the follow-up rewrite and the filename filter, so the caller's own words are tried — and only then is
+the request refused. A refusal never calls the answer model; it names what was searched and quotes the rank-1
+candidate's cosine and filename whether or not that candidate passed anything, so the score is evidence rather
+than a gate.
+
+`LlmContextGrader` fails **open** on purpose: a blank or unparseable reply means "no opinion", and the caller
+must then not refuse a question the model could have answered; only an explicit `NONE` is read as "nothing here
+answers this". It is constructed with a plain `VectorStore` (production passes the `HybridVectorStore`) so the
+coverage judgement reflects fusion, not the re-ranker's opinion of it.
+
+### [`SummarizingChatMemory.java`](src/main/java/com/example/springai/memory/SummarizingChatMemory.java)
+
+A `ChatMemory` decorator that turns the plain message window into a rolling summary. `MessageWindowChatMemory`
+drops the oldest messages once the window fills, so a long conversation silently forgets its opening; the fix
+here is not a bigger window (the local model's context is too small) but a compressed one. Once the stored
+history passes `trigger-messages`, everything but the last `keep-recent-messages` is folded into one
+`SystemMessage` — `"Summary of earlier conversation: …"` — that stays at the head, and the delegate is
+`clear`ed and rewritten with the summary plus the recent turns. `MessageChatMemoryAdvisor` is untouched: it
+still reads and writes a plain `ChatMemory` and never learns that the older turns were rewritten. Below the
+trigger this class only forwards, so a short conversation is byte-identical to the plain window.
+
+Every failure mode degrades toward keeping the transcript intact: a summarizer that throws or returns blank
+leaves memory as the window left it rather than replacing history with nothing, and the summary is redacted by
+`PiiRedactor` before it is stored so a secret in the transcript does not ride back in on the summary. Config:
+`app.memory.summarization.enabled` / `trigger-messages` / `keep-recent-messages` / `max-window-messages` /
+`max-summary-chars`.
 
 ### [`AgenticLoopService.java`](src/main/java/com/example/springai/agent/AgenticLoopService.java)
 

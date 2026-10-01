@@ -7,7 +7,7 @@ import org.springframework.ai.reader.TextReader;
 import org.springframework.ai.transformer.splitter.TokenTextSplitter;
 import org.springframework.ai.vectorstore.VectorStore;
 import org.springframework.ai.vectorstore.filter.FilterExpressionBuilder;
-import com.example.springai.vectorstore.HybridVectorStore;
+import com.example.springai.vectorstore.KeywordLegRebuildable;
 import org.springframework.boot.CommandLineRunner;
 import org.springframework.core.io.Resource;
 import org.springframework.core.io.support.PathMatchingResourcePatternResolver;
@@ -63,9 +63,10 @@ public class RagDocumentIngestionService implements CommandLineRunner {
         }
         // A restore writes chunks straight into the inner store, bypassing the hybrid decorator's add() and
         // therefore its keyword index. Rebuilding here — after both the restore and the refresh above — is
-        // what keeps the keyword leg populated across a restart.
-        if (vectorStore instanceof HybridVectorStore hybrid) {
-            hybrid.rebuildKeywordIndex();
+        // what keeps the keyword leg populated across a restart. The check is on the keyword-leg capability,
+        // not on HybridVectorStore: the primary store is a re-ranking decorator that wraps it.
+        if (vectorStore instanceof KeywordLegRebuildable rebuildable) {
+            rebuildable.rebuildKeywordIndex();
         }
     }
 
