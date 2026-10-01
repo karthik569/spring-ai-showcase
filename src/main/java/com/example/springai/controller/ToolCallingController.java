@@ -63,6 +63,46 @@ public class ToolCallingController {
         return answered(prompt, answer);
     }
 
+    @GetMapping("/calculate")
+    public Map<String, String> calculate(@RequestParam(defaultValue = "What is 128 * 46 + 1024?") String prompt) {
+        String answer = chatClient.prompt()
+                .user(prompt)
+                .toolNames("calculate")
+                .options(LOW_TEMPERATURE)
+                .call()
+                .content();
+
+        return answered(prompt, answer);
+    }
+
+    @GetMapping("/datetime")
+    public Map<String, String> dateTime(@RequestParam(defaultValue = "What time is it in London right now?") String prompt) {
+        String answer = chatClient.prompt()
+                .user(prompt)
+                .toolNames("getCurrentDateTime")
+                .options(LOW_TEMPERATURE)
+                .call()
+                .content();
+
+        return answered(prompt, answer);
+    }
+
+    // The agentic endpoint: the full toolbox is offered and the model chains whichever tools the question
+    // needs — arithmetic, the clock, the order system and the knowledge base in a single turn.
+    @GetMapping("/assistant")
+    public Map<String, String> assistant(
+            @RequestParam(defaultValue = "How many days of annual leave do I get, and what is 3 times that number?") String prompt) {
+        String answer = chatClient.prompt()
+                .user(prompt)
+                .toolNames("getCurrentWeather", "getOrderStatus", "calculate", "getCurrentDateTime",
+                        "searchKnowledgeBase")
+                .options(LOW_TEMPERATURE)
+                .call()
+                .content();
+
+        return answered(prompt, answer);
+    }
+
     // An empty answer would otherwise look like a successful call; the tool log shows whether one ran.
     private static Map<String, String> answered(String prompt, String answer) {
         if (answer == null || answer.isBlank()) {

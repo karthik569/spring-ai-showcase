@@ -166,7 +166,10 @@
         <select id="toolMode">
             <option value="weather">weather tool</option>
             <option value="order">order tool</option>
-            <option value="multi">both tools</option>
+            <option value="multi">weather + order</option>
+            <option value="calculate">calculator tool</option>
+            <option value="datetime">date/time tool</option>
+            <option value="assistant">assistant (all tools + knowledge base)</option>
         </select>
         <label for="toolPrompt">Prompt</label>
         <textarea id="toolPrompt">What is the weather like in Tokyo right now?</textarea>
@@ -361,7 +364,10 @@
             const prompts = {
                 weather: 'What is the weather like in Tokyo right now?',
                 order: 'Can you give me the shipping status for order ORD-101?',
-                multi: 'Check the weather in London, and also check the delivery status of order ORD-103.'
+                multi: 'Check the weather in London, and also check the delivery status of order ORD-103.',
+                calculate: 'What is 128 * 46 + 1024?',
+                datetime: 'What time is it in London right now?',
+                assistant: 'How many days of annual leave do I get, and what is 3 times that number?'
             };
             const prompt = document.getElementById('toolPrompt').value.trim() || prompts[mode];
             return call(s, '/api/ai/tools/' + mode + '?prompt=' + encodeURIComponent(prompt));

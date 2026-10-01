@@ -4,16 +4,16 @@
 # Starts the local llama.cpp OpenAI-compatible server on port 8081
 # ==============================================================================
 
-MODEL_PATH="/sdcard/Download/termux/models/qwen2.5-0.5b-instruct-q4_k_m.gguf"
+MODEL_PATH="/sdcard/Download/termux/models/qwen2.5-1.5b-instruct-q4_k_m.gguf"
 PORT=8081
 THREADS=4
-CTX_SIZE=2048
+CTX_SIZE=4096
 
 if [ ! -f "$MODEL_PATH" ]; then
     echo "[ERROR] Model file not found at: $MODEL_PATH"
-    echo "Downloading Qwen2.5-0.5B-Instruct..."
+    echo "Downloading Qwen2.5-1.5B-Instruct..."
     mkdir -p /sdcard/Download/termux/models
-    curl -L -o "$MODEL_PATH" "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf"
+    curl -L -o "$MODEL_PATH" "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf"
 fi
 
 echo "================================================================="
