@@ -1,6 +1,7 @@
 package com.example.springai.dto;
 
 import com.example.springai.support.ConversationIds;
+import io.swagger.v3.oas.annotations.media.Schema;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Size;
 
@@ -14,8 +15,15 @@ import jakarta.validation.constraints.Size;
  *                       as it did before the field existed.
  */
 public record RagQueryRequest(
+        @Schema(description = "Question to answer from the knowledge base",
+                example = "How much is the home office stipend?")
         @NotBlank(message = "question must not be blank") String question,
+        @Schema(description = "Optional metadata filter, restricting retrieval to one ingested document",
+                example = "company-policy.md")
         String filename,
+        @Schema(description = "Optional conversation id; a follow-up is resolved against that conversation's "
+                + "stored history before retrieval runs. Omit or leave blank for a stateless query.",
+                example = "rag-1")
         @Size(max = ConversationIds.MAX_CHARS,
                 message = "conversationId is limited to {max} characters") String conversationId
 ) {}

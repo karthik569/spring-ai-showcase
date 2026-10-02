@@ -3,6 +3,9 @@ package com.example.springai.controller;
 import com.example.springai.dto.CodeReviewReport;
 import com.example.springai.dto.MovieRecommendation;
 import com.example.springai.error.StructuredOutputParseException;
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.Parameter;
+import io.swagger.v3.oas.annotations.tags.Tag;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.client.ChatClient;
@@ -17,6 +20,7 @@ import java.util.function.Supplier;
 
 @RestController
 @RequestMapping("/api/ai/structured")
+@Tag(name = "Structured output", description = "Model output bound to a Java record, validated and retried once")
 public class StructuredOutputController {
 
     private static final Logger log = LoggerFactory.getLogger(StructuredOutputController.class);
@@ -51,7 +55,11 @@ public class StructuredOutputController {
     }
 
     @GetMapping("/movie")
-    public MovieRecommendation recommendMovie(@RequestParam(defaultValue = "Sci-Fi") String genre) {
+    @Operation(summary = "Structured movie recommendation",
+            description = "Returns a typed MovieRecommendation. A reply with blank required fields is retried once, then surfaces as a structured 422.")
+    public MovieRecommendation recommendMovie(
+            @Parameter(description = "Genre to recommend from", example = "Sci-Fi")
+            @RequestParam(defaultValue = "Sci-Fi") String genre) {
         return validated(MovieRecommendation.class, () -> chatClient.prompt()
                 .system("You are a film critic database. Reply with one JSON object and no other text.")
                 .user(u -> u.text("""
@@ -66,7 +74,11 @@ public class StructuredOutputController {
     }
 
     @PostMapping("/code-review")
-    public CodeReviewReport reviewCode(@RequestBody String codeSnippet) {
+    @Operation(summary = "Structured code review",
+            description = "POST the source text as the raw request body. Returns a typed CodeReviewReport.")
+    public CodeReviewReport reviewCode(
+            @io.swagger.v3.oas.annotations.parameters.RequestBody(description = "Source code to review")
+            @RequestBody String codeSnippet) {
         return validated(CodeReviewReport.class, () -> chatClient.prompt()
                 .system("You are a Principal Software Security & Performance Architect. Reply with one JSON object and no other text.")
                 .user(u -> u.text("""

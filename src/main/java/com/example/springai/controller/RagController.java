@@ -8,6 +8,9 @@ import com.example.springai.guardrail.PromptInjectionDetector;
 import com.example.springai.rag.RagCoverageGate;
 import com.example.springai.service.RagDocumentIngestionService;
 import com.example.springai.service.RagQueryResolver;
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.Parameter;
+import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -35,6 +38,7 @@ import java.util.regex.Pattern;
 
 @RestController
 @RequestMapping("/api/ai/rag")
+@Tag(name = "RAG", description = "Grounded answers with citations, raw retrieval scores, and document upload")
 public class RagController {
 
     private static final Logger log = LoggerFactory.getLogger(RagController.class);
@@ -86,6 +90,8 @@ public class RagController {
     }
 
     @PostMapping("/query")
+    @Operation(summary = "Grounded answer with citations",
+            description = "Retrieves context and answers with the chunks that reached the prompt. Grounding is decided before the model is asked: groundingOutcome is GROUNDED, RE_QUERIED, REFUSED or DISABLED, and REFUSED is built with no model call.")
     public RagQueryResponse queryKnowledgeBase(@Valid @RequestBody RagQueryRequest request) {
         long start = System.currentTimeMillis();
 
@@ -163,9 +169,14 @@ public class RagController {
     // An inspection endpoint: an empty list must not look like an empty store, so the reason for zero
     // matches is reported.
     @GetMapping("/search")
+    @Operation(summary = "Raw retrieval scores",
+            description = "The vector+BM25 ranking with each chunk's cosine and no similarity floor — use it to see the score the grounded path's threshold would reject.")
     public Map<String, Object> rawVectorSearch(
+            @Parameter(description = "Search text", example = "how much is the home office stipend?")
             @RequestParam String query,
+            @Parameter(description = "Max results (0 falls back to app.rag.top-k)", example = "3")
             @RequestParam(required = false, defaultValue = "0") int topK,
+            @Parameter(description = "Restrict to one ingested document", example = "company-policy.md")
             @RequestParam(required = false) String filename) {
 
         SearchRequest.Builder search = SearchRequest.builder()
@@ -209,7 +220,11 @@ public class RagController {
     // Without the explicit consumes, springdoc documents this as application/json and Swagger UI renders a
     // JSON body editor for a part that only exists as multipart — "Try it out" cannot pick a file.
     @PostMapping(value = "/documents", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
-    public Map<String, Object> addDocument(@RequestParam("file") MultipartFile file) {
+    @Operation(summary = "Upload a document",
+            description = "Indexes a text/Markdown file; re-uploading the same filename replaces its chunks. An upload matching prompt-injection rules is rejected when guardrails.block-injection-on-ingest is on.")
+    public Map<String, Object> addDocument(
+            @Parameter(description = "Text or Markdown file, up to 512 KB")
+            @RequestParam("file") MultipartFile file) {
         if (file.isEmpty()) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "file part is empty");
         }

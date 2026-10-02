@@ -1,6 +1,9 @@
 package com.example.springai.controller;
 
 import com.example.springai.error.ImageDownloadException;
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.Parameter;
+import io.swagger.v3.oas.annotations.tags.Tag;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.content.Media;
 import org.springframework.core.io.ByteArrayResource;
@@ -20,6 +23,7 @@ import java.util.Map;
 
 @RestController
 @RequestMapping("/api/ai/vision")
+@Tag(name = "Vision", description = "Image understanding from a public URL")
 public class MultimodalController {
 
     // Many CDNs (Wikimedia included) reject headerless downloads with 403. UrlResource cannot send one.
@@ -34,8 +38,13 @@ public class MultimodalController {
     }
 
     @GetMapping("/analyze")
+    @Operation(summary = "Analyze an image URL",
+            description = "Downloads a public http(s) image and answers a question about it. Private, loopback and link-local addresses are refused (SSRF guard), and the backend must be vision-capable.")
     public Map<String, String> analyzeImage(
+            @Parameter(description = "Absolute http(s) URL of a public image",
+                    example = "https://upload.wikimedia.org/wikipedia/commons/3/3a/Cat03.jpg")
             @RequestParam String imageUrl,
+            @Parameter(description = "Question about the image", example = "Describe what you see in this image in detail.")
             @RequestParam(defaultValue = "Describe what you see in this image in detail.") String question) {
 
         URI target = publicHttpUri(imageUrl);
