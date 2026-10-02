@@ -3,13 +3,14 @@
 For someone who has **never used Spring AI**. Roughly 20 minutes to a running app and a working intuition for
 what each capability is.
 
-Four documents, four jobs:
+Five documents, five jobs:
 
 | Document | For whom |
 | :--- | :--- |
 | **this file** | first time — install it, run it, understand what you are looking at |
 | [`README.md`](../README.md) | reference — every endpoint, every config key, every error code |
 | [`ARCHITECTURE_AND_METHODS.md`](../ARCHITECTURE_AND_METHODS.md) | the *why* — class by class, including the traps |
+| [`docs/RUN_AND_TEST.md`](RUN_AND_TEST.md) | **Windows / macOS / Linux** — how to start a backend and test *every* endpoint, with the model each one uses |
 | [`docs/SESSION-HANDOFF.md`](SESSION-HANDOFF.md) | maintainer notes — machine-specific, not a tutorial |
 
 ---

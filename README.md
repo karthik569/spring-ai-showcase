@@ -69,8 +69,10 @@ records request and response **bodies** but never **headers**, so a key cannot r
 ### Termux / llama.cpp
 
 `start-offline-llm.sh` and `start-spring-ai.sh` are Termux-only (`cd /sdcard/...`, `llama-server`) and do not
-work on Windows or macOS. `start-offline-llm.sh` starts **two** llama.cpp servers, because `llama-server` loads
-one model per process:
+work on Windows or macOS. **For step-by-step instructions that run on Windows, macOS or Linux — including how to
+start the llama.cpp servers and which model each endpoint uses — see
+[docs/RUN_AND_TEST.md](docs/RUN_AND_TEST.md).** `start-offline-llm.sh` starts **two** llama.cpp servers, because
+`llama-server` loads one model per process:
 
 | Port | Model | Env |
 | :--- | :--- | :--- |
